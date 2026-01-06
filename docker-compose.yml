@@ -1,16 +1,36 @@
 version: '3.8'
+
 services:
   proxy:
-    # 告诉 Docker 从当前目录构建镜像
-    build: .
+    # 使用你发布到 GitHub Packages 的镜像
+    image: ghcr.io/kevin-yst-du/proxy-server-vps:latest
     container_name: proxy-vps
     restart: always
-    # 使用 Host 网络模式，直接使用宿主机的 21011 端口，性能最高
-    network_mode: "host"
+    
+    # 端口映射: 左边是VPS对外端口，右边是容器内部端口
+    # 如果你想用 host 模式 (性能稍好，仅限 Linux)，可以注释掉 ports，打开 network_mode
+    ports:
+      - "21011:21011"
+    # network_mode: "host"
+
     environment:
+      # --- 核心配置 ---
       - PORT=21011
-      - PASSWORD=123456
-      - MAX_REDIRECTS=5
-      - ENABLE_CACHE=true
-      - CACHE_TTL=3600
-      - DAILY_LIMIT_COUNT=200
+      - PASSWORD=123456  # ⚠️ 请务必修改此密码
+      
+      # --- 功能开关 ---
+      - ENABLE_CACHE=true        # 开启缓存 (推荐 true)
+      - CACHE_TTL=3600           # 缓存时间 (秒)
+      - MAX_REDIRECTS=5          # 最大重定向次数
+      
+      # --- 限制与安全 (可选) ---
+      - DAILY_LIMIT_COUNT=200    # 每日请求限制
+      # - ALLOW_IPS=1.2.3.4      # 仅允许特定 IP (留空允许所有)
+      # - ADMIN_IPS=127.0.0.1    # 管理员 IP (用于重置额度)
+      
+    # 资源限制 (可选，防止内存泄漏)
+    deploy:
+      resources:
+        limits:
+          cpus: '0.50'
+          memory: 512M
