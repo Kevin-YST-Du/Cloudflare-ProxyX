@@ -1,13 +1,17 @@
 name: Build and Release Binaries
 
 on:
-  # 1. 手动触发
+  # 1. 手动触发：增加了版本号输入框
   workflow_dispatch:
     inputs:
-      note:
-        description: '构建备注'
+      version:
+        description: '发布版本号 (例如 v1.0.0)'
+        required: true
+        default: 'v1.0.0-manual'
+      body:
+        description: '更新说明'
         required: false
-        default: 'Manual Build'
+        default: '手动构建发布'
 
   # 2. 自动触发：推送 v* 标签时
   push:
@@ -15,7 +19,7 @@ on:
       - 'v*'
 
 permissions:
-  contents: write
+  contents: write # 必须有写权限才能发 Release
 
 jobs:
   build-and-release:
@@ -29,7 +33,7 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '18'
-          # cache: 'npm'  <--- 【关键】删除了这一行，解决了你的报错
+          # cache: 'npm' # 既然你没有 lock 文件，这行我已经删掉了，避免报错
 
       - name: Install dependencies
         run: npm install
@@ -37,24 +41,30 @@ jobs:
       - name: Build Binaries with PKG
         run: |
           npm run build-bin
-          echo "查看生成的文件:"
+          echo "Listing dist files:"
           ls -l dist/
 
-      # 如果是手动触发，上传到 Artifacts
-      - name: Upload Artifacts (For Manual Build)
-        if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
-        with:
-          name: proxy-server-binaries
-          path: dist/*
-          retention-days: 3
+      # --- 关键修改：生成 Release 标签名 ---
+      # 如果是手动触发，使用输入的 version；如果是 Tag 触发，使用 ref_name
+      - name: Determine Tag Name
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "name=${{ inputs.version }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
 
-      # 如果是打标签 (v*)，发布正式 Release
+      # --- 发布 Release (不再区分手动还是自动，统统发布) ---
       - name: Create Release and Upload Assets
-        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
+          # 强制指定 Release 的标签名
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: Release ${{ steps.tag.outputs.name }}
+          body: ${{ inputs.body || 'Auto-generated release from tag' }}
           files: dist/*
-          generate_release_notes: true
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
