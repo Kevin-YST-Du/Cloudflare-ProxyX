@@ -1,20 +1,35 @@
 name: Build and Release
 
 on:
+  # 1. 允许手动触发构建 (Manual Trigger)
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for image (optional, e.g., v1.0.1)'
+        required: false
+        default: 'manual-latest'
+  
+  # 2. 推送 v* 标签时触发 (如 v1.0.0)
   push:
     tags:
-      - 'v*'    # 推送 v1.0.0 这样的标签时触发构建和发布
+      - 'v*'
     branches:
-      - main    # 推送 main 分支时测试构建
-      
+      - main
+
 env:
-  # 替换成你的 Docker Hub 用户名/镜像名
-  IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/proxy-server-vps
+  # Docker Hub 镜像名
+  DOCKER_IMAGE: ${{ secrets.DOCKER_USERNAME }}/proxy-server-vps
+  # GitHub Container Registry 镜像名 (自动获取仓库名)
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/proxy-server-vps
 
 jobs:
-  # 任务 1: 构建 Docker 镜像 (支持 amd64 和 arm64)
   build-docker:
     runs-on: ubuntu-latest
+    # 授予写入 GitHub Packages 的权限
+    permissions:
+      contents: read
+      packages: write
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -25,6 +40,7 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
+      # --- 登录 Docker Hub ---
       - name: Login to Docker Hub
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
@@ -32,30 +48,54 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: Extract metadata
+      # --- 登录 GitHub Container Registry (GHCR) ---
+      - name: Login to GitHub Container Registry
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # --- 生成元数据 (自动处理 Docker Hub 和 GHCR 的标签) ---
+      - name: Extract metadata (tags, labels)
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.IMAGE_NAME }}
+          # 这里列出两个镜像地址，它会自动生成对应的 tags
+          images: |
+            ${{ env.DOCKER_IMAGE }}
+            ${{ env.GHCR_IMAGE }}
           tags: |
-            type=ref,event=branch
+            # 自动处理语义化版本 v1.0.0
             type=semver,pattern={{version}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=semver,pattern={{major}}.{{minor}}
+            # main 分支推送到 latest
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # 手动触发时，使用输入的 tag 或默认值
+            type=raw,value=${{ inputs.tag_name }},enable=${{ github.event_name == 'workflow_dispatch' }}
 
-      - name: Build and push
+      # --- 构建并推送 (同时推送到两个仓库) ---
+      - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
+          # 支持多架构
           platforms: linux/amd64,linux/arm64
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
-  # 任务 2: 编译二进制文件
+  # ===================================================
+  # 任务 2: 编译二进制文件 (仅在打 tag 或手动触发且指定了版本号时运行)
+  # ===================================================
   build-binaries:
     needs: build-docker
-    if: startsWith(github.ref, 'refs/tags/')
+    # 只有是 Tag 推送，或者是手动触发时才编译二进制
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 需要写入 Release 的权限
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -73,9 +113,19 @@ jobs:
           npm run build-bin
           ls -l dist/
 
-      - name: Create Release
+      # 只有在 Git Tag 触发时才创建正式 Release
+      - name: Create Release (Git Tag)
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           files: dist/*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      # 如果是手动触发，将二进制文件上传为 Artifacts (供下载测试)
+      - name: Upload Artifacts (Manual Run)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: proxy-server-binaries
+          path: dist/*
