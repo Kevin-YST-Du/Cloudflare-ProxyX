@@ -3,7 +3,7 @@
 # ================= 默认配置 =================
 DEFAULT_PORT=21011
 DEFAULT_PASSWORD="admin"
-INSTALL_DIR="/opt/proxy-server"
+INSTALL_DIR="/opt/proxyx"
 # ===========================================
 
 # --- 1. 交互式获取配置 ---
@@ -80,7 +80,7 @@ npm install --production
 
 # --- 6. 配置 Systemd ---
 echo "⚙️ 配置 Systemd 服务..."
-cat > /etc/systemd/system/proxy-node.service <<EOF
+cat > /etc/systemd/system/proxyx.service <<EOF
 [Unit]
 Description=Proxy Server Node
 After=network.target
@@ -99,13 +99,13 @@ EOF
 
 # --- 7. 启动服务 ---
 systemctl daemon-reload
-systemctl enable proxy-node
-systemctl restart proxy-node
+systemctl enable proxyx
+systemctl restart proxyx
 
 # --- 8. 验证与输出 ---
 echo "--------------------------------"
 echo "✅ 安装完成！服务已启动。"
 echo "🌐 访问地址: http://$(curl -s ifconfig.me):$PORT/$PASSWORD/"
-echo "📂 配置文件: $INSTALL_DIR/.env (修改后需重启服务: systemctl restart proxy-node)"
-echo "🔍 查看状态: systemctl status proxy-node"
+echo "📂 配置文件: $INSTALL_DIR/.env (修改后需重启服务: systemctl restart proxyx)"
+echo "🔍 查看状态: systemctl status proxyx"
 echo "--------------------------------"
