@@ -1,4 +1,4 @@
-# Cloudflare-Accel (Ultimate Edition)
+# Cloudflare-ProxyX (Ultimate Edition)
 
 基于 Cloudflare Workers 的全能下载代理与 Docker 镜像加速服务。
 
