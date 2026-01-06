@@ -1,0 +1,16 @@
+version: '3.8'
+services:
+  proxy:
+    # 告诉 Docker 从当前目录构建镜像
+    build: .
+    container_name: proxy-vps
+    restart: always
+    # 使用 Host 网络模式，直接使用宿主机的 21011 端口，性能最高
+    network_mode: "host"
+    environment:
+      - PORT=21011
+      - PASSWORD=123456
+      - MAX_REDIRECTS=5
+      - ENABLE_CACHE=true
+      - CACHE_TTL=3600
+      - DAILY_LIMIT_COUNT=200
