@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  proxy:
+    # 本地构建
+    build: .
+    
+    container_name: proxy-vps
+    restart: always
+    
+    # 网络模式推荐 Host (性能最好，直接使用 VPS 的 21011 端口)
+    network_mode: "host"
+    
+    # 如果不使用 Host 模式，请取消下面 ports 的注释
+    # ports:
+    #   - "21011:21011"
+
+    # --- 核心环境变量配置 ---
+    environment:
+      # [基础配置]
+      - PORT=21011
+      - PASSWORD=123456             # 必填：访问密码
+      - MAX_REDIRECTS=5             # 最大重定向次数
+      - ENABLE_CACHE=true           # 开启缓存 (推荐 true)
+      - CACHE_TTL=3600              # 缓存时间 (秒)
+
+      # [访问控制 - 安全]
+      # 留空代表不限制，多个值用逗号分隔 (例如: "baidu.com,qq.com")
+      - BLACKLIST=                  # 域名黑名单
+      - WHITELIST=                  # 域名白名单 (设置后只允许白名单)
+      - ALLOW_IPS=                  # 仅允许访问的客户端 IP
+      - ALLOW_COUNTRIES=            # 仅允许访问的国家代码 (如 CN,US)
+
+      # [额度限制]
+      - DAILY_LIMIT_COUNT=200       # 每个 IP 每日最大请求次数
+
+      # [权限管理]
+      # 管理员 IP (拥有重置额度、查看全站统计的权限)
+      # 多个 IP 用逗号分隔
+      - ADMIN_IPS=127.0.0.1,你的服务器公网IP
+
+      # 免额度 IP 白名单 (这些 IP 请求不计入每日限制)
+      - IP_LIMIT_WHITELIST=127.0.0.1
+        
