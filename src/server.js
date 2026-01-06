@@ -428,10 +428,10 @@ app.all(['/:password', '/:password/*'], async (req, res) => {
     } catch (e) { res.status(502).send(`General Proxy Error: ${e.message}`); }
 });
 
-app.use((req, res) => res.status(404).send('404 Not Found - Powered by VPS Proxy'));
+app.use((req, res) => res.status(404).send('404 Not Found - Powered by ProxyX'));
 
 app.listen(PORT, () => {
-    console.log(`VPS Proxy Server running on port ${PORT}`);
+    console.log(`ProxyX Server running on port ${PORT}`);
     console.log(`Config loaded with Password: ${CONFIG.PASSWORD}`);
 });
 
