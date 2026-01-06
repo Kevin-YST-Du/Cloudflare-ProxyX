@@ -18,9 +18,9 @@ on:
 
 env:
   # Docker Hub 镜像名
-  DOCKER_IMAGE: ${{ secrets.DOCKER_USERNAME }}/proxy-server-vps
+  DOCKER_IMAGE: ${{ secrets.DOCKER_USERNAME }}/proxyx
   # GitHub Container Registry 镜像名 (自动获取仓库名)
-  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/proxy-server-vps
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/proxyx
 
 jobs:
   build-docker:
@@ -127,5 +127,5 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: proxy-server-binaries
+          name: proxyx
           path: dist/*
