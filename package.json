@@ -1,5 +1,5 @@
 {
-  "name": "proxy-server-vps",
+  "name": "proxyx",
   "version": "4.3.0",
   "description": "Ultimate Docker & Linux Recursive Proxy Server",
   "main": "src/server.js",
