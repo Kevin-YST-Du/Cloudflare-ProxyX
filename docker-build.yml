@@ -5,7 +5,7 @@ services:
     # 本地构建
     build: .
     
-    container_name: proxy-vps
+    container_name: proxyx
     restart: always
     
     # 网络模式推荐 Host (性能最好，直接使用 VPS 的 21011 端口)
