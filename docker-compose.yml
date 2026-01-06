@@ -3,7 +3,7 @@ version: '3.8'
 services:
   proxy: 
     # 使用 GitHub 镜像 (如果你想直接拉取)
-     image: ghcr.io/kevin-yst-du/proxy-server-vps:latest
+     image: ghcr.io/kevin-yst-du/proxyx
     
     container_name: proxy-vps
     restart: always
