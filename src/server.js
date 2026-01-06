@@ -1,13 +1,33 @@
 /**
  * -----------------------------------------------------------------------------------------
- * VPS Node.js 版: 终极 Docker & Linux 代理 (v4.3 - 递归缓存增强版)
+ * VPS Node.js 版: 终极 Docker & Linux 代理 (v4.5 - 全配置动态版)
  * -----------------------------------------------------------------------------------------
  * 运行环境: Node.js v18+
- * 默认端口: 21011
+ * 功能:
+ * 1. 自动加载同目录下的 .env 配置文件 (支持二进制/脚本/Docker)。
+ * 2. 包含你要求的所有配置项 (黑白名单、管理员IP、额度限制等)。
+ * 3. 递归模式强制文本处理 + 缓存。
+ * 4. 仪表盘 UI 样式统一。
  * -----------------------------------------------------------------------------------------
  */
 
-require('dotenv').config();
+const path = require('path');
+const fs = require('fs');
+
+// --- 1. 智能加载 .env 配置文件 ---
+// 逻辑: 优先查找可执行文件同级目录下的 .env，如果没有则查找当前目录
+const envPath = process.pkg 
+    ? path.join(path.dirname(process.execPath), '.env') 
+    : path.join(__dirname, '.env');
+
+if (fs.existsSync(envPath)) {
+    console.log(`[Config] Loading config from: ${envPath}`);
+    require('dotenv').config({ path: envPath });
+} else {
+    // 兼容 Docker (环境变量直接注入) 或普通 Node 运行
+    require('dotenv').config(); 
+}
+
 const express = require('express');
 const NodeCache = require('node-cache');
 const http = require('http');
@@ -15,29 +35,71 @@ const https = require('https');
 
 // --- 初始化 Express 和 缓存 ---
 const app = express();
-const myCache = new NodeCache({ stdTTL: 3600 }); // 默认缓存 1 小时
-const PORT = process.env.PORT || 21011; // 默认监听 21011 端口
+// 读取 CACHE_TTL 环境变量，默认 3600 秒
+const cacheTTL = parseInt(process.env.CACHE_TTL || "3600");
+const myCache = new NodeCache({ stdTTL: cacheTTL }); 
+const PORT = process.env.PORT || 21011; 
 
-// --- 内存级频率限制存储 (替代 KV) ---
+// --- 内存级频率限制存储 ---
 const rateLimitStore = new Map();
 
 // ==============================================================================
-// 1. 全局配置 (优先读取环境变量)
+// 2. 全局配置 (严格映射你要求的所有字段)
 // ==============================================================================
 
-const CONFIG = {
-    PASSWORD: process.env.PASSWORD || "123456",
-    MAX_REDIRECTS: parseInt(process.env.MAX_REDIRECTS || "5"),
-    ENABLE_CACHE: (process.env.ENABLE_CACHE || "true") === "true",
-    CACHE_TTL: parseInt(process.env.CACHE_TTL || "3600"),
-    BLACKLIST: (process.env.BLACKLIST || "").split(/[\n,]/).map(s => s.trim()).filter(s => s),
-    WHITELIST: (process.env.WHITELIST || "").split(/[\n,]/).map(s => s.trim()).filter(s => s),
-    ALLOW_IPS: (process.env.ALLOW_IPS || "").split(/[\n,]/).map(s => s.trim()).filter(s => s),
-    ALLOW_COUNTRIES: (process.env.ALLOW_COUNTRIES || "").split(/[\n,]/).map(s => s.trim()).filter(s => s),
-    DAILY_LIMIT_COUNT: parseInt(process.env.DAILY_LIMIT_COUNT || "200"),
-    ADMIN_IPS: (process.env.ADMIN_IPS || "127.0.0.1").split(/[\n,]/).map(s => s.trim()).filter(s => s),
-    IP_LIMIT_WHITELIST: (process.env.IP_LIMIT_WHITELIST || "127.0.0.1").split(/[\n,]/).map(s => s.trim()).filter(s => s),
+// 辅助函数: 将字符串按逗号或换行符分割成数组，并去空
+const parseList = (val, defaultVal) => {
+    const source = val || defaultVal || "";
+    return source.split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
 };
+
+const CONFIG = {
+    // --- 基础配置 ---
+    // 访问密码
+    PASSWORD: process.env.PASSWORD || "123456",
+    
+    // 最大重定向次数
+    MAX_REDIRECTS: parseInt(process.env.MAX_REDIRECTS || "5"),
+    
+    // 是否开启缓存 (字符串转布尔)
+    ENABLE_CACHE: (process.env.ENABLE_CACHE || "true") === "true",
+    
+    // 缓存时间 (秒)
+    CACHE_TTL: cacheTTL,
+    
+    // --- 访问控制 (安全设置) ---
+    // 域名黑名单
+    BLACKLIST: parseList(process.env.BLACKLIST, ""),
+    
+    // 域名白名单 (若不为空，则只允许白名单内的域名)
+    WHITELIST: parseList(process.env.WHITELIST, ""),
+    
+    // 允许访问的客户端 IP
+    ALLOW_IPS: parseList(process.env.ALLOW_IPS, ""),
+    
+    // 允许访问的国家代码
+    ALLOW_COUNTRIES: parseList(process.env.ALLOW_COUNTRIES, ""),
+    
+    // --- 额度限制 ---
+    // 每日最大请求次数
+    DAILY_LIMIT_COUNT: parseInt(process.env.DAILY_LIMIT_COUNT || "200"),
+    
+    // --- 权限管理 ---
+    // 管理员 IP (拥有重置、统计权限)
+    ADMIN_IPS: parseList(process.env.ADMIN_IPS, "127.0.0.1"),
+    
+    // 免额度 IP 白名单 (不计入每日限制)
+    IP_LIMIT_WHITELIST: parseList(process.env.IP_LIMIT_WHITELIST, "127.0.0.1"),
+};
+
+// 打印当前生效的关键配置 (调试用)
+console.log("---------------------------------------");
+console.log("Current Configuration:");
+console.log(`PORT: ${PORT}`);
+console.log(`PASSWORD: ${CONFIG.PASSWORD}`);
+console.log(`ENABLE_CACHE: ${CONFIG.ENABLE_CACHE}`);
+console.log(`ADMIN_IPS: ${JSON.stringify(CONFIG.ADMIN_IPS)}`);
+console.log("---------------------------------------");
 
 // Docker 上游配置
 const REGISTRY_MAP = {
@@ -70,23 +132,18 @@ const LINUX_MIRRORS = {
 const LIGHTNING_SVG = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" stroke="#F59E0B" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
 // ==============================================================================
-// 2. 中间件与辅助函数
+// 3. 中间件
 // ==============================================================================
 
-// 获取客户端 IP
 const getClientIP = (req) => {
     return req.headers['x-forwarded-for'] || req.socket.remoteAddress || '0.0.0.0';
 };
 
-// 日期工具
 const getDate = () => new Date(new Date().getTime() + 28800000).toISOString().split('T')[0];
 
-// 速率限制检查
 const checkRateLimit = (req, res, next) => {
     const ip = getClientIP(req);
     if (CONFIG.IP_LIMIT_WHITELIST.includes(ip)) return next();
-
-    // 简单过滤静态资源
     if (req.path === '/' || req.path === '/favicon.ico' || req.path === '/robots.txt') return next();
 
     const today = getDate();
@@ -101,7 +158,6 @@ const checkRateLimit = (req, res, next) => {
     next();
 };
 
-// 允许跨域
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD");
@@ -111,7 +167,6 @@ app.use((req, res, next) => {
     next();
 });
 
-// 安全检查 (IP 黑白名单)
 app.use((req, res, next) => {
     const ip = getClientIP(req);
     if (CONFIG.ALLOW_IPS.length > 0 && !CONFIG.ALLOW_IPS.includes(ip)) {
@@ -124,28 +179,24 @@ app.use(checkRateLimit);
 app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
 // ==============================================================================
-// 3. 路由逻辑
+// 4. 业务逻辑
 // ==============================================================================
 
-// --- 3.0 静态资源 ---
 app.get('/robots.txt', (req, res) => res.type('text/plain').send("User-agent: *\nDisallow: /"));
 app.get('/favicon.ico', (req, res) => res.type('image/svg+xml').send(LIGHTNING_SVG));
 
-// --- 3.1 Docker Token 认证 ---
+// --- Token ---
 app.get('/token', async (req, res) => {
     const scope = req.query.scope;
     let upstreamAuthUrl = 'https://auth.docker.io/token';
-    
     for (const [domain, _] of Object.entries(REGISTRY_MAP)) {
         if (scope && scope.includes(domain)) {
             upstreamAuthUrl = `https://${domain}/token`;
             break;
         }
     }
-
     const newUrl = new URL(upstreamAuthUrl);
     newUrl.search = new URLSearchParams(req.query).toString();
-
     if (upstreamAuthUrl === 'https://auth.docker.io/token') {
         newUrl.searchParams.set('service', 'registry.docker.io');
         if (scope && scope.startsWith('repository:')) {
@@ -156,38 +207,27 @@ app.get('/token', async (req, res) => {
             }
         }
     }
-
     try {
         const upstreamRes = await fetch(newUrl, {
-            headers: {
-                'User-Agent': 'Docker-Client/24.0.5 (linux)',
-                'Host': newUrl.hostname
-            }
+            headers: { 'User-Agent': 'Docker-Client/24.0.5 (linux)', 'Host': newUrl.hostname }
         });
-        
         res.status(upstreamRes.status);
         upstreamRes.headers.forEach((v, k) => res.setHeader(k, v));
         const data = await upstreamRes.arrayBuffer();
         res.send(Buffer.from(data));
-    } catch (e) {
-        res.status(500).send(e.message);
-    }
+    } catch (e) { res.status(500).send(e.message); }
 });
 
-// --- 3.2 Docker V2 API ---
+// --- Docker V2 ---
 app.use('/v2', async (req, res) => {
     let path = req.path;
     if (path === '/') path = '';
-    
     let targetDomain = 'registry-1.docker.io'; 
     let upstream = 'https://registry-1.docker.io';
 
     if (path === '' || path === '/') {
         try {
-            const rootReq = await fetch('https://registry-1.docker.io/v2/', { 
-                method: req.method, 
-                headers: req.headers 
-            });
+            const rootReq = await fetch('https://registry-1.docker.io/v2/', { method: req.method, headers: req.headers });
             if (rootReq.status === 401) {
                 const wwwAuth = rootReq.headers.get('WWW-Authenticate');
                 if (wwwAuth) {
@@ -243,17 +283,11 @@ app.use('/v2', async (req, res) => {
         if ([301, 302, 303, 307, 308].includes(response.status)) {
             const location = response.headers.get('Location');
             if (location) {
-                const blobResp = await fetch(location, {
-                    method: 'GET',
-                    headers: { 'User-Agent': 'Docker-Client/24.0.5 (linux)' }
-                });
+                const blobResp = await fetch(location, { method: 'GET', headers: { 'User-Agent': 'Docker-Client/24.0.5 (linux)' } });
                 res.status(blobResp.status);
                 blobResp.headers.forEach((v, k) => {
-                    if (k !== 'content-encoding' && k !== 'transfer-encoding') {
-                        res.setHeader(k, v);
-                    }
+                    if (k !== 'content-encoding' && k !== 'transfer-encoding') res.setHeader(k, v);
                 });
-                
                 const arrayBuffer = await blobResp.arrayBuffer();
                 res.send(Buffer.from(arrayBuffer));
                 return;
@@ -264,16 +298,15 @@ app.use('/v2', async (req, res) => {
         response.headers.forEach((v, k) => res.setHeader(k, v));
         const arrayBuffer = await response.arrayBuffer();
         res.send(Buffer.from(arrayBuffer));
-
-    } catch (e) {
-        res.status(502).send(`Docker Proxy Error: ${e.message}`);
-    }
+    } catch (e) { res.status(502).send(`Docker Proxy Error: ${e.message}`); }
 });
 
-// --- 3.3 通用代理入口 ---
-app.all('/:password/*', async (req, res) => {
+// --- 通用代理 ---
+// 支持 /密码 和 /密码/ 两种访问方式
+app.all(['/:password', '/:password/*'], async (req, res) => {
     const password = req.params.password;
-    let subPath = req.params[0]; 
+    // req.params[0] 是通配符 * 的内容，如果没有通配符则为 undefined
+    let subPath = req.params[0] || ""; 
 
     if (password !== CONFIG.PASSWORD) {
         return res.status(404).send("404 Not Found");
@@ -281,7 +314,6 @@ app.all('/:password/*', async (req, res) => {
 
     const clientIP = getClientIP(req);
 
-    // --- 管理员命令 ---
     if (subPath === "reset") {
         if (!CONFIG.ADMIN_IPS.includes(clientIP)) return res.status(403).send("Forbidden");
         rateLimitStore.delete(`${clientIP}:${getDate()}`);
@@ -303,13 +335,11 @@ app.all('/:password/*', async (req, res) => {
         return res.json({ status: "success", data: { totalRequests: 0, uniqueIps: stats.length, details: stats } });
     }
 
-    // --- Dashboard ---
     if (!subPath) {
         const count = rateLimitStore.get(`${clientIP}:${getDate()}`) || 0;
         return res.send(renderDashboard(req.hostname, CONFIG.PASSWORD, clientIP, count, CONFIG.DAILY_LIMIT_COUNT, CONFIG.ADMIN_IPS));
     }
 
-    // --- Linux 源加速 ---
     const sortedMirrors = Object.keys(LINUX_MIRRORS).sort((a, b) => b.length - a.length);
     const linuxDistro = sortedMirrors.find(k => subPath.startsWith(k + '/') || subPath === k);
 
@@ -317,28 +347,18 @@ app.all('/:password/*', async (req, res) => {
         const realPath = subPath.replace(linuxDistro, '').replace(/^\//, '');
         const upstreamBase = LINUX_MIRRORS[linuxDistro];
         const targetUrl = upstreamBase.endsWith('/') ? upstreamBase + realPath : upstreamBase + '/' + realPath;
-        
         try {
             const headers = { ...req.headers };
             delete headers['host'];
-            
-            const linuxRes = await fetch(targetUrl, {
-                method: req.method,
-                headers: headers,
-                redirect: 'follow'
-            });
-            
+            const linuxRes = await fetch(targetUrl, { method: req.method, headers: headers, redirect: 'follow' });
             res.status(linuxRes.status);
             linuxRes.headers.forEach((v, k) => res.setHeader(k, v));
             const arrayBuffer = await linuxRes.arrayBuffer();
             res.send(Buffer.from(arrayBuffer));
             return;
-        } catch (e) {
-            return res.status(502).send(`Linux Mirror Error: ${e.message}`);
-        }
+        } catch (e) { return res.status(502).send(`Linux Mirror Error: ${e.message}`); }
     }
 
-    // --- 通用文件/递归加速 ---
     let proxyMode = 'raw';
     let targetUrlStr = subPath;
 
@@ -351,7 +371,6 @@ app.all('/:password/*', async (req, res) => {
         targetUrlStr = 'https://' + targetUrlStr.replace(/^(https?):\/+/, '$1://');
     }
 
-    // --- 递归模式缓存检查 ---
     const cacheKey = req.originalUrl;
     if (proxyMode === 'recursive' && CONFIG.ENABLE_CACHE) {
         const cachedBody = myCache.get(cacheKey);
@@ -392,10 +411,8 @@ app.all('/:password/*', async (req, res) => {
 
         if (proxyMode === 'recursive') {
             let text = await upstreamRes.text();
-            
             const workerOrigin = `${req.protocol}://${req.get('host')}`;
             const proxyBase = `${workerOrigin}/${CONFIG.PASSWORD}/r/`;
-
             const regex = /(https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))/g;
             
             text = text.replace(regex, (match) => {
@@ -406,24 +423,17 @@ app.all('/:password/*', async (req, res) => {
             if (CONFIG.ENABLE_CACHE && upstreamRes.status === 200) {
                 myCache.set(cacheKey, text);
             }
-
             res.send(text);
         }
-
-    } catch (e) {
-        res.status(502).send(`General Proxy Error: ${e.message}`);
-    }
+    } catch (e) { res.status(502).send(`General Proxy Error: ${e.message}`); }
 });
 
-// 默认路由
 app.use((req, res) => res.status(404).send('404 Not Found - Powered by VPS Proxy'));
 
-// 启动服务器
 app.listen(PORT, () => {
     console.log(`VPS Proxy Server running on port ${PORT}`);
-    console.log(`Password: ${CONFIG.PASSWORD}`);
+    console.log(`Config loaded with Password: ${CONFIG.PASSWORD}`);
 });
-
 
 // ==============================================================================
 // 4. Dashboard 渲染 (CSS 未压缩)
