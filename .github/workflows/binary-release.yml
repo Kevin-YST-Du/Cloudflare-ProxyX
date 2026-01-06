@@ -1,70 +1,60 @@
 name: Build and Release Binaries
 
 on:
-  # 1. 手动触发：允许你在 GitHub 网页端点按钮触发构建
+  # 1. 手动触发
   workflow_dispatch:
     inputs:
       note:
-        description: '构建备注 (可选)'
+        description: '构建备注'
         required: false
         default: 'Manual Build'
 
-  # 2. 自动触发：当你推送 v 开头的标签时 (如 v1.0.0) 自动发布 Release
+  # 2. 自动触发：推送 v* 标签时
   push:
     tags:
       - 'v*'
 
 permissions:
-  contents: write # 允许 Action 创建 Release 并上传文件
+  contents: write
 
 jobs:
   build-and-release:
     runs-on: ubuntu-latest
 
     steps:
-      # --- 第一步：检出代码 ---
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # --- 第二步：配置 Node.js ---
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '18'
-          cache: 'npm' # 开启缓存，加速后续构建
+          # cache: 'npm'  <--- 【关键】删除了这一行，解决了你的报错
 
-      # --- 第三步：安装依赖 ---
       - name: Install dependencies
         run: npm install
 
-      # --- 第四步：编译二进制文件 ---
-      # 这一步会调用 package.json 中的 build-bin 命令
-      # pkg 会根据配置生成 Linux, Windows, macOS 的文件到 dist/ 目录
       - name: Build Binaries with PKG
         run: |
           npm run build-bin
           echo "查看生成的文件:"
           ls -l dist/
 
-      # --- 第五步 (情况A)：如果是手动触发，上传到 Artifacts ---
-      # 此时不会发布 Release，而是生成一个临时的下载链接供你测试
+      # 如果是手动触发，上传到 Artifacts
       - name: Upload Artifacts (For Manual Build)
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: proxy-server-binaries-test
+          name: proxy-server-binaries
           path: dist/*
-          retention-days: 3 # 测试文件保留3天
+          retention-days: 3
 
-      # --- 第六步 (情况B)：如果是打标签 (v*)，发布正式 Release ---
-      # 自动创建 Release 页面并上传二进制文件
+      # 如果是打标签 (v*)，发布正式 Release
       - name: Create Release and Upload Assets
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v1
         with:
           files: dist/*
-          generate_release_notes: true # 自动生成更新日志
-          draft: false
-          prerelease: false
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
