@@ -1,0 +1,31 @@
+{
+  "name": "proxy-server-vps",
+  "version": "4.3.0",
+  "description": "Ultimate Docker & Linux Recursive Proxy Server",
+  "main": "src/server.js",
+  "bin": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "build-bin": "pkg src/server.js --out-path dist/ --compress GZip"
+  },
+  "pkg": {
+    "scripts": "src/**/*.js",
+    "targets": [
+      "node18-linux-x64",
+      "node18-linux-arm64",
+      "node18-win-x64",
+      "node18-macos-x64"
+    ]
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "node-cache": "^5.1.2",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "pkg": "^5.8.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
