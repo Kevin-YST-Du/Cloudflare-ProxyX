@@ -3,8 +3,8 @@
 # ================= 默认配置 =================
 DEFAULT_PORT=21011
 DEFAULT_PASSWORD="admin"
-INSTALL_DIR="/opt/proxy-server"
-BINARY_NAME="proxy-server" # 脚本会找这个名字的文件
+INSTALL_DIR="/opt/proxyx"
+BINARY_NAME="proxyx" # 脚本会找这个名字的文件
 # ===========================================
 
 # --- 0. 核心检查：目录下有没有二进制文件？ ---
@@ -12,9 +12,9 @@ if [ ! -f "$BINARY_NAME" ]; then
     echo "❌ 错误：当前目录下未找到名为 '$BINARY_NAME' 的文件。"
     echo "----------------------------------------------------"
     echo "请按以下步骤操作："
-    echo "1. 从 GitHub Releases 下载对应的二进制文件 (如 proxy-server-vps-linux-x64)。"
+    echo "1. 从 GitHub Releases 下载对应的二进制文件 (如 proxyx-linux-x64)。"
     echo "2. 上传到当前目录。"
-    echo "3. 将其重命名为 '$BINARY_NAME' (命令: mv proxy-server-vps-linux-x64 $BINARY_NAME)。"
+    echo "3. 将其重命名为 '$BINARY_NAME' (命令: mv proxyx-linux-x64 $BINARY_NAME)。"
     echo "4. 赋予执行权限 (命令: chmod +x $BINARY_NAME)。"
     echo "5. 再次运行本脚本。"
     echo "----------------------------------------------------"
@@ -74,7 +74,7 @@ EOF
 # --- 4. 配置 Systemd 服务 (开机自启) ---
 echo "⚙️ 配置 Systemd 服务..."
 # 注意：WorkingDirectory 非常重要，确保程序能读到 .env
-cat > /etc/systemd/system/proxy-bin.service <<EOF
+cat > /etc/systemd/system/proxyx.service <<EOF
 [Unit]
 Description=Proxy Server Binary
 After=network.target
@@ -94,8 +94,8 @@ EOF
 
 # --- 5. 启动服务 ---
 systemctl daemon-reload
-systemctl enable proxy-bin
-systemctl restart proxy-bin
+systemctl enable proxyx
+systemctl restart proxyx
 
 # --- 6. 验证与输出 ---
 # 获取公网 IP (如果失败则显示 localhost)
@@ -106,6 +106,6 @@ echo "✅ 安装完成！服务已启动。"
 echo "🌐 访问地址: http://$PUBLIC_IP:$PORT/$PASSWORD/"
 echo "📂 程序目录: $INSTALL_DIR"
 echo "📄 配置文件: $INSTALL_DIR/.env (修改配置后请重启服务)"
-echo "🔄 重启命令: systemctl restart proxy-bin"
-echo "🔍 查看状态: systemctl status proxy-bin"
+echo "🔄 重启命令: systemctl restart proxyx"
+echo "🔍 查看状态: systemctl status proxyx"
 echo "--------------------------------"
