@@ -431,51 +431,142 @@ async function setDuplicateFlag(ip, path) {
     await cache.put(key, new Response("1", { headers: { "Cache-Control": "max-age=5" } }));
 }
 
-// KV 读取/写入/重置逻辑
+// 新增 D1数据库 KV 读取/写入/重置逻辑 
 async function getIpUsageCount(ip, env) {
+    // 优先使用 D1 数据库
+    if (env.DB) {
+        try {
+            const today = getDate();
+            // 只需要读取 count 字段，节省读取行成本
+            const result = await env.DB.prepare("SELECT count FROM ip_limits WHERE ip = ? AND date = ?")
+                .bind(ip, today)
+                .first();
+            return result ? result.count : 0;
+        } catch (e) {
+            console.error("D1 Read Error:", e); // 出错降级到 KV
+        }
+    }
+
+    // 降级使用 KV
     if (!env.IP_LIMIT_KV) return 0;
     const val = await env.IP_LIMIT_KV.get(`limit:${ip}:${getDate()}`);
     return parseInt(val || "0");
 }
 
 async function incrementIpUsage(ip, env) {
+    // 优先使用 D1
+    if (env.DB) {
+        try {
+            const today = getDate();
+            const time = Date.now();
+            // 【省额度核心】Upsert 语法：如果不存在则插入 1，如果存在则 +1。
+            // 这是一个原子操作，且只消耗一次 D1 写入额度。
+            await env.DB.prepare(`
+                INSERT INTO ip_limits (ip, date, count, updated_at) 
+                VALUES (?, ?, 1, ?) 
+                ON CONFLICT(ip, date) 
+                DO UPDATE SET count = count + 1, updated_at = ?
+            `).bind(ip, today, time, time).run();
+            return;
+        } catch (e) {
+            console.error("D1 Write Error:", e);
+        }
+    }
+
+    // 降级使用 KV
     if (!env.IP_LIMIT_KV) return;
     const key = `limit:${ip}:${getDate()}`;
+    // 注意：KV 并没有原子加操作，高并发下其实是不准的，D1 解决了这个问题
     const val = await env.IP_LIMIT_KV.get(key);
     await env.IP_LIMIT_KV.put(key, (parseInt(val || "0") + 1).toString(), { expirationTtl: 86400 });
 }
 
 async function resetIpUsage(ip, env) {
-    if (!env.IP_LIMIT_KV) return;
-    await env.IP_LIMIT_KV.delete(`limit:${ip}:${getDate()}`);
+    if (env.DB) {
+        try {
+            await env.DB.prepare("DELETE FROM ip_limits WHERE ip = ? AND date = ?")
+                .bind(ip, getDate())
+                .run();
+        } catch(e) { console.error(e); }
+    }
+    
+    // 同时尝试删除 KV (保持数据同步，防止切回 KV 时数据错乱)
+    if (env.IP_LIMIT_KV) {
+        await env.IP_LIMIT_KV.delete(`limit:${ip}:${getDate()}`);
+    }
 }
 
 async function resetAllIpStats(env) {
-    if (!env.IP_LIMIT_KV) return;
-    const list = await env.IP_LIMIT_KV.list({ prefix: `limit:`, limit: 1000 });
-    for (const key of list.keys) {
-        await env.IP_LIMIT_KV.delete(key.name);
+    if (env.DB) {
+        // D1 清空非常快，直接 Truncate 或 Delete All
+        try {
+            await env.DB.prepare("DELETE FROM ip_limits").run();
+        } catch(e) { console.error(e); }
+    }
+
+    // 同时也清空 KV
+    if (env.IP_LIMIT_KV) {
+        let cursor = null;
+        do {
+            const list = await env.IP_LIMIT_KV.list({ prefix: `limit:`, limit: 1000, cursor });
+            cursor = list.cursor;
+            for (const key of list.keys) {
+                await env.IP_LIMIT_KV.delete(key.name);
+            }
+        } while (cursor); // 循环删除直到清空
     }
 }
 
 // 获取全站统计
 async function getAllIpStats(env) {
+    // 优先使用 D1 (性能极高)
+    if (env.DB) {
+        try {
+            const today = getDate();
+            
+            // 1. 获取总请求数 (聚合查询)
+            const sumResult = await env.DB.prepare("SELECT SUM(count) as total, COUNT(*) as unique_ips FROM ip_limits WHERE date = ?").bind(today).first();
+            const total = sumResult.total || 0;
+            const uniqueIps = sumResult.unique_ips || 0;
+
+            // 2. 获取前 100 名详情 (排序查询)
+            const listResult = await env.DB.prepare("SELECT ip, count FROM ip_limits WHERE date = ? ORDER BY count DESC LIMIT 100").bind(today).all();
+            
+            return { 
+                totalRequests: total, 
+                uniqueIps: uniqueIps, 
+                details: listResult.results 
+            };
+        } catch (e) {
+            console.error("D1 Stats Error:", e);
+            // 出错不返回空，尝试走 KV
+        }
+    }
+
+    // 降级 KV 逻辑 (保持原样，用于兼容)
     if (!env.IP_LIMIT_KV) return { totalRequests: 0, uniqueIps: 0, details: [] };
     const today = getDate();
     let total = 0;
     let details = [];
-    const list = await env.IP_LIMIT_KV.list({ prefix: `limit:`, limit: 100 }); 
+    // 注意：KV list 默认一次最多 1000 个，如果量大这里其实显示不全，这是 KV 的劣势
+    const list = await env.IP_LIMIT_KV.list({ prefix: `limit:`, limit: 1000 }); 
     for (const key of list.keys) {
         const parts = key.name.split(':');
+        // 过滤掉非今天的 key (如果有历史残留)
         if (parts.length === 3 && parts[2] === today) {
+            // 这里有个性能坑：KV list 不返回 value，需要再次 get。
+            // 为了不卡死，这里我们只在 KV 模式下做一个简单的近似统计，或者你接受慢一点
+            // 优化：limit.metadata 可以存 count，但这里代码没存，所以只能读
             const val = await env.IP_LIMIT_KV.get(key.name);
             const count = parseInt(val || "0");
             total += count;
             details.push({ ip: parts[1], count: count });
         }
     }
+    // 内存排序
     details.sort((a, b) => b.count - a.count);
-    return { totalRequests: total, uniqueIps: details.length, details };
+    // 截取前 100
+    return { totalRequests: total, uniqueIps: details.length, details: details.slice(0, 100) };
 }
 
 // --- 3.5 Linux 软件源加速逻辑 ---
@@ -528,9 +619,14 @@ async function handleLinuxMirrorRequest(request, upstreamBase, path) {
 // ==============================================================================
 async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw', ctx) {
     let currentUrlStr = targetUrlStr;
-    // 容错：如果用户没写协议头，补全 https://
-    if (!currentUrlStr.startsWith("http")) {
-        currentUrlStr = 'https://' + currentUrlStr.replace(/^(https?):\/+/, '$1://');
+    
+    // [修改] 容错增强：处理 Cloudflare 合并斜杠问题 (https:/ -> https://) 及补全协议
+    if (currentUrlStr.startsWith("http")) {
+        // 如果自带协议，强制修正斜杠数量为2个
+        currentUrlStr = currentUrlStr.replace(/^(https?):\/+/, '$1://');
+    } else {
+        // 如果没带协议，补全 https://
+        currentUrlStr = 'https://' + currentUrlStr;
     }
 
     // --- 缓存检查 (仅针对递归模式) ---
