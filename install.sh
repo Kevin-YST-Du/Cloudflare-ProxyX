@@ -62,11 +62,12 @@ MAX_REDIRECTS=5
 ENABLE_CACHE=true
 CACHE_TTL=3600
 
-# --- 访问控制 (留空代表允许所有) ---
+# # --- 访问控制 (留空代表允许所有) ---
 BLACKLIST=
 WHITELIST=
 ALLOW_IPS=
 ALLOW_COUNTRIES=
+ALLOW_REFERER=github.com,nodeseek.com
 
 # --- 额度与权限 ---
 DAILY_LIMIT_COUNT=200

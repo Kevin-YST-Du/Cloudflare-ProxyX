@@ -70,7 +70,18 @@ PASSWORD=$PASSWORD
 MAX_REDIRECTS=5
 ENABLE_CACHE=true
 CACHE_TTL=3600
+
+# # --- 访问控制 (留空代表允许所有) ---
+BLACKLIST=
+WHITELIST=
+ALLOW_IPS=
+ALLOW_COUNTRIES=
+
+# --- 额度与权限 ---
+DAILY_LIMIT_COUNT=200
 ADMIN_IPS=127.0.0.1
+IP_LIMIT_WHITELIST=127.0.0.1
+ALLOW_REFERER=github.com,nodeseek.com
 EOF
 
 # --- 4. 配置 Systemd 服务 ---
