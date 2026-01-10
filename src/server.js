@@ -605,8 +605,9 @@ app.listen(PORT, () => {
 
 
 // ==============================================================================
-// 5. Dashboard HTML 渲染 (完整未压缩)
+// 4. Dashboard 渲染 (UI 界面 - 最终修复版: 递归模块仓库路径修正)
 // ==============================================================================
+
 function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     const percent = Math.min(Math.round((count / limit) * 100), 100);
     const isAdmin = adminIps.includes(ip);
@@ -622,7 +623,6 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(LIGHTNING_SVG)}">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-/* CSS: Uncompressed as requested */
 body {
   min-height: 100vh;
   display: flex;
@@ -634,7 +634,7 @@ body {
   margin: 0;
 }
 
-/* Light Mode */
+/* ========== Light Mode ========== */
 .light-mode {
   background-color: #f3f4f6;
   color: #1f293b;
@@ -670,7 +670,7 @@ body {
   border: 1px solid #fca5a5;
 }
 
-/* Dark Mode */
+/* ========== Dark Mode ========== */
 .dark-mode {
   background-color: #0f172a;
   color: #e2e8f0;
@@ -716,7 +716,7 @@ body {
   background-color: #f1f5f9;
 }
 
-/* Common */
+/* ========== Common Styles ========== */
 .code-area,
 pre,
 .select-all {
@@ -742,6 +742,7 @@ pre,
   z-index: 1;
 }
 
+/* ========== Responsive ========== */
 @media (max-width: 768px) {
   .custom-content-wrapper {
     width: 100% !important;
@@ -762,6 +763,7 @@ pre,
   }
 }
 
+/* ========== Top Navigation ========== */
 .top-nav {
   position: fixed;
   top: 1.5rem;
@@ -802,6 +804,7 @@ pre,
   background: rgba(255, 255, 255, 0.2);
 }
 
+/* ========== Toast ========== */
 .toast {
   position: fixed;
   bottom: 3rem;
@@ -827,6 +830,7 @@ pre,
   transform: translateX(-50%) translateY(0);
 }
 
+/* ========== Inputs ========== */
 input,
 select {
   outline: none;
@@ -846,6 +850,7 @@ select:focus {
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
 }
 
+/* ========== Modal ========== */
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -1068,7 +1073,7 @@ select:focus {
             <button onclick="copyLinuxCommand()" class="w-full bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition">复制命令</button>
         </div>
       </div>
- 
+  
       <div class="section-box">
           <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
               <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
@@ -1087,12 +1092,12 @@ select:focus {
               复制配置
           </button>
       </div>
- 
+  
       <footer class="mt-12 text-center pb-8">
             <a href="https://github.com/Kevin-YST-Du/Cloudflare-ProxyX" target="_blank" class="text-[10px] text-blue-600 dark:text-blue-400 uppercase tracking-widest font-bold opacity-80 hover:opacity-100 hover:underline transition-all">Powered by Kevin-YST-Du/Cloudflare-ProxyX</a>
       </footer>
     </div>
- 
+  
     <div id="confirmModal" class="modal-overlay">
       <div class="modal-content">
          <div class="text-center">
@@ -1131,7 +1136,7 @@ select:focus {
     <script>
       try {
           // --- 初始化全局变量 ---
-          window.CURRENT_DOMAIN = window.location.hostname + (window.location.port ? ':' + window.location.port : '');
+          window.CURRENT_DOMAIN = window.location.hostname;
           window.WORKER_PASSWORD = "${password}"; 
           window.CURRENT_CLIENT_IP = "${ip}";
           window.LINUX_MIRRORS = ${linuxMirrorsJson};
@@ -1162,7 +1167,7 @@ select:focus {
           const daemonJsonStr = JSON.stringify(daemonJsonObj, null, 2);
           const daemonEl = document.getElementById('daemon-json-content');
           if (daemonEl) daemonEl.textContent = daemonJsonStr;
- 
+  
           // --- 主题切换逻辑 ---
           window.toggleTheme = function() {
             try {
@@ -1183,7 +1188,7 @@ select:focus {
           
           // 页面加载时恢复主题设置
           try { if (localStorage.getItem('theme') === 'dark') window.toggleTheme(); } catch(e) {}
- 
+  
           // --- 提示框 (Toast) 工具 ---
           window.showToast = function(message, isError = false) {
             const toast = document.getElementById('toast');
@@ -1191,30 +1196,21 @@ select:focus {
             toast.className = 'toast ' + (isError ? 'bg-red-500' : 'bg-slate-800') + ' show';
             setTimeout(() => toast.classList.remove('show'), 3000);
           }
- 
+  
           // --- 模态框控制 ---
           window.openModal = function(id) { document.getElementById(id).classList.add('open'); }
           window.closeModal = function(id) { document.getElementById(id).classList.remove('open'); }
- 
+  
           // --- 剪贴板复制工具 ---
           window.copyToClipboard = function(text) {
-            if (navigator.clipboard && window.isSecureContext) { 
-                return navigator.clipboard.writeText(text); 
-            }
-            // 降级方案：HTTP 环境兼容
+            if (navigator.clipboard && window.isSecureContext) { return navigator.clipboard.writeText(text); }
             const textArea = document.createElement("textarea");
-            textArea.value = text; textArea.style.position = "fixed"; textArea.style.left = "-9999px";
+            textArea.value = text; textArea.style.position = "fixed";
             document.body.appendChild(textArea); textArea.focus(); textArea.select();
-            try { 
-                document.execCommand('copy'); 
-                document.body.removeChild(textArea); 
-                return Promise.resolve(); 
-            } catch (err) { 
-                document.body.removeChild(textArea); 
-                return Promise.reject(err); 
-            }
+            try { document.execCommand('copy'); document.body.removeChild(textArea); return Promise.resolve(); } 
+            catch (err) { document.body.removeChild(textArea); return Promise.reject(err); }
           }
- 
+  
           // ======================================================================
           // 核心逻辑: GitHub/通用加速 (智能识别 Git Clone vs Wget)
           // ======================================================================
@@ -1235,11 +1231,8 @@ select:focus {
                     return window.showToast('❌ 无法识别有效链接', true);
                 }
             }
-            
-            // 修复双斜杠问题
-            originalUrl = originalUrl.replace(/^(https?):\/+/, '$1://');
 
-            const prefix = window.location.protocol + '//' + window.CURRENT_DOMAIN + '/' + window.WORKER_PASSWORD + '/';
+            const prefix = window.location.origin + '/' + window.WORKER_PASSWORD + '/';
             const proxiedUrl = prefix + originalUrl;
 
             let finalCommand = "";
@@ -1248,7 +1241,9 @@ select:focus {
             // 判断是否为纯链接
             const isPureUrl = (input === match?.[0]) || (('https://' + input) === originalUrl);
             
-            // 判断是否为 GitHub 仓库主页 (而非文件)
+            // 【新增】判断是否为 GitHub 仓库主页 (而非文件)
+            // 匹配: github.com/user/repo 或 github.com/user/repo.git
+            // 排除: /blob/ 等路径
             const repoRegex = /^https?:\\/\\/(?:www\\.)?github\\.com\\/[^\\/]+\\/[^\\/]+(?:\\.git)?\\/?$/;
 
             if (isPureUrl) {
@@ -1301,12 +1296,10 @@ select:focus {
             } else {
                 if (!targetUrl.startsWith('http')) { targetUrl = 'https://' + targetUrl; }
             }
-            // 修复双斜杠
-            targetUrl = targetUrl.replace(/^(https?):\/+/, '$1://');
             
-            // 2. 构造两种代理路径
-            const baseUrl = window.location.protocol + '//' + window.CURRENT_DOMAIN + '/' + window.WORKER_PASSWORD + '/';
-            const rawProxyUrl = baseUrl + targetUrl;       // 不带 /r/
+            // 2. 构造两种代理路径 (RawPath 用于 Git, RecursivePath 用于脚本)
+            const baseUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/';
+            const rawProxyUrl = baseUrl + targetUrl;      // 不带 /r/
             const recursiveProxyUrl = baseUrl + 'r/' + targetUrl; // 带 /r/
 
             // 3. 智能判断生成模式
@@ -1317,7 +1310,8 @@ select:focus {
             let displayUrl = recursiveProxyUrl; // 默认显示递归链接
 
             if (isCommand && urlMatch) {
-                 // 场景 A: 完整命令
+                 // 场景 A: 完整命令 (如 curl | bash)
+                 // 如果命令中包含 'git clone'，或者 URL 是一个 repo，通常应该用 Raw Path
                  if (input.includes('git clone') || repoRegex.test(targetUrl)) {
                      recursiveCommand = input.replace(targetUrl, rawProxyUrl);
                      displayUrl = rawProxyUrl;
@@ -1329,13 +1323,13 @@ select:focus {
             } else {
                  // 场景 B: 纯链接
                  if (repoRegex.test(targetUrl)) {
-                     // B1: 是 GitHub 仓库 -> Git Clone -> 使用 Raw Path
+                     // B1: 是 GitHub 仓库 -> Git Clone -> 【关键修复】使用 Raw Path (不带 /r/)
                      recursiveCommand = 'git clone ' + rawProxyUrl;
                      displayUrl = rawProxyUrl; 
                      label = "终端命令 (Git Clone):";
                      window.showToast('✅ 已识别为仓库 (Raw模式)');
                  } else {
-                     // B2: 是普通文件/脚本 -> Wget -> 使用 Recursive Path
+                     // B2: 是普通文件/脚本 -> Wget -> 使用 Recursive Path (带 /r/)
                      const fileName = targetUrl.split('/').pop() || 'script';
                      recursiveCommand = 'wget -c -O "' + fileName + '" "' + recursiveProxyUrl + '"';
                      displayUrl = recursiveProxyUrl;
@@ -1344,7 +1338,7 @@ select:focus {
                  }
             }
             
-            recursiveUrlOnly = displayUrl; 
+            recursiveUrlOnly = displayUrl; // 更新复制按钮的目标
             
             document.getElementById('recursive-result-url').textContent = recursiveUrlOnly;
             document.getElementById('recursive-cmd-label').textContent = "2. " + label; 
@@ -1355,7 +1349,7 @@ select:focus {
           window.copyRecursiveUrlOnly = function() { window.copyToClipboard(recursiveUrlOnly).then(() => window.showToast('✅ 链接已复制')); }
           window.openRecursiveUrl = function() { window.open(recursiveUrlOnly, '_blank'); }
           window.copyRecursiveCmd = function() { window.copyToClipboard(recursiveCommand).then(() => window.showToast('✅ 命令已复制')); }
- 
+  
           // --- 业务逻辑: Docker 镜像 ---
           window.convertDockerImage = function() {
             const input = document.getElementById('docker-image').value.trim();
@@ -1370,8 +1364,8 @@ select:focus {
           // --- 业务逻辑: Linux 换源 ---
           window.generateLinuxCommand = function() {
               const distro = document.getElementById('linux-distro').value;
-              const baseUrl = window.location.protocol + '//' + window.CURRENT_DOMAIN + '/' + window.WORKER_PASSWORD + '/' + distro + '/';
-              const securityUrl = window.location.protocol + '//' + window.CURRENT_DOMAIN + '/' + window.WORKER_PASSWORD + '/' + distro + '-security/';
+              const baseUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/' + distro + '/';
+              const securityUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/' + distro + '-security/';
               
               if (distro === 'ubuntu') {
                   linuxCommand = 'sudo sed -i "s|http://archive.ubuntu.com/ubuntu/|' + baseUrl + '|g" /etc/apt/sources.list && ' +
@@ -1387,6 +1381,21 @@ select:focus {
                   linuxCommand = 'sudo sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/*.repo && ' +
                                  'sudo sed -i "s|#baseurl=http://mirror.centos.org|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/*.repo && ' +
                                  'sudo sed -i "s|baseurl=http://mirror.centos.org|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/*.repo';
+              } else if (distro === 'rockylinux') {
+                  linuxCommand = 'sudo sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/rocky*.repo && ' +
+                                 'sudo sed -i "s|#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/rocky*.repo && ' +
+                                 'sudo sed -i "s|baseurl=http://dl.rockylinux.org/$contentdir|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/rocky*.repo';
+              } else if (distro === 'almalinux') {
+                  linuxCommand = 'sudo sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/almalinux*.repo && ' +
+                                 'sudo sed -i "s|#baseurl=https://repo.almalinux.org/almalinux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/almalinux*.repo && ' +
+                                 'sudo sed -i "s|baseurl=https://repo.almalinux.org/almalinux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/almalinux*.repo';
+              } else if (distro === 'fedora') {
+                  linuxCommand = 'sudo sed -i "s/metalink/#metalink/g" /etc/yum.repos.d/fedora*.repo && ' +
+                                 'sudo sed -i "s|#baseurl=http://download.example/pub/fedora/linux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/fedora*.repo && ' +
+                                 'sudo sed -i "s|baseurl=http://download.example/pub/fedora/linux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/fedora*.repo';
+              } else if (distro === 'alpine') {
+                  linuxCommand = 'sudo sed -i "s|http://dl-cdn.alpinelinux.org/alpine|' + baseUrl + '|g" /etc/apk/repositories && ' +
+                                 'sudo sed -i "s|https://dl-cdn.alpinelinux.org/alpine|' + baseUrl + '|g" /etc/apk/repositories';
               } else if (distro === 'termux') {
                   linuxCommand = 'sed -i "s|https://[^ ]*termux[^ ]*|' + baseUrl + '|g" $PREFIX/etc/apt/sources.list';
               } else {
@@ -1400,7 +1409,7 @@ select:focus {
           window.copyLinuxCommand = function() { window.copyToClipboard(linuxCommand).then(() => window.showToast('✅ 已复制')); }
 
           window.copyDaemonJson = function() { window.copyToClipboard(daemonJsonStr).then(() => window.showToast('✅ JSON 配置已复制')); }
- 
+  
           // --- 业务逻辑: 重置额度 ---
           window.confirmReset = async function() {
             window.closeModal('confirmModal');
