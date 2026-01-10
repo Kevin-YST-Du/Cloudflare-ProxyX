@@ -18,7 +18,7 @@ services:
     # --- 核心环境变量配置 ---
     environment:
       # [基础配置]
-      - PORT=21011
+      - PORT=21011                  # 监听端口
       - PASSWORD=123456             # 必填：访问密码
       - MAX_REDIRECTS=5             # 最大重定向次数
       - ENABLE_CACHE=true           # 开启缓存
