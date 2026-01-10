@@ -56,23 +56,23 @@ cd $INSTALL_DIR
 echo "📄 生成配置文件 (.env)..."
 cat > .env <<EOF
 # --- 基础配置 ---
-PORT=$PORT
-PASSWORD=$PASSWORD
-MAX_REDIRECTS=5
-ENABLE_CACHE=true
-CACHE_TTL=3600
+PORT=$PORT                  # 监听端口
+PASSWORD=$PASSWORD     # 访问密码
+MAX_REDIRECTS=5             # 最大跳转次数
+ENABLE_CACHE=true           # 是否开启缓存
+CACHE_TTL=3600              # 缓存时长(秒)
 
-# # --- 访问控制 (留空代表允许所有) ---
-BLACKLIST=
-WHITELIST=
-ALLOW_IPS=
-ALLOW_COUNTRIES=
-ALLOW_REFERER=github.com,nodeseek.com
+# --- 访问控制 (留空代表允许所有) ---
+BLACKLIST=                  # 黑名单
+WHITELIST=                  # 白名单
+ALLOW_IPS=                  # 允许的IP
+ALLOW_COUNTRIES=            # 允许的国家/地区
 
 # --- 额度与权限 ---
-DAILY_LIMIT_COUNT=200
-ADMIN_IPS=127.0.0.1
-IP_LIMIT_WHITELIST=127.0.0.1
+DAILY_LIMIT_COUNT=200       # 每日额度
+ADMIN_IPS=127.0.0.1         # 管理员IP
+IP_LIMIT_WHITELIST=127.0.0.1 # IP白名单
+ALLOW_REFERER=github.com,nodeseek.com # 允许的来源域名
 EOF
 
 # --- 5. 安装依赖 ---
