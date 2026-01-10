@@ -1,4 +1,4 @@
-name: Build and Release
+name: 构建docker镜像
 
 on:
   # 1. 允许手动触发构建 (Manual Trigger)
