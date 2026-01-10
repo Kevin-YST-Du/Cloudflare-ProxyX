@@ -55,7 +55,7 @@ bash install.sh # 执行一键安装
 ```
 git clone https://github.com/Kevin-YST-Du/Cloudflare-ProxyX.git #git我的仓库
 cd Cloudflare-ProxyX # 进入我的目录
-wget https://github.com/Kevin-YST-Du/Cloudflare-ProxyX/releases/download/v3.5.0/proxyx-linux-x64 #下载最新版本的二进制包
+wget https://github.com/Kevin-YST-Du/Cloudflare-ProxyX/releases/download/v3.6.0/proxyx-linux-x64 #下载最新版本的二进制包
 bash install-binary.sh
 ```
 ---
