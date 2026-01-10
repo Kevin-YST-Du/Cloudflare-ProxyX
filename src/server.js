@@ -1,13 +1,19 @@
 /**
  * -----------------------------------------------------------------------------------------
  * ProxyX Server (VPS Node.js Edition)
- * 版本: v4.7 (Sync with Worker v4.5)
+ * 版本: v4.8 (GeoIP Integrated)
  * -----------------------------------------------------------------------------------------
- * 核心功能同步:
- * 1. [新增] ALLOW_REFERER 免密访问 (支持域名/URL前缀匹配)。
- * 2. [新增] 管理员 IP 免密访问 Dashboard 和代理路径。
- * 3. [优化] 递归/Docker 核心逻辑与 Cloudflare Worker 版本保持一致。
- * 4. [保留] 针对 VPS 环境的自动修正双斜杠 (https:/ -> https://) 容错逻辑。
+ * 核心功能:
+ * 1. Docker Hub/GHCR 等镜像仓库加速下载。
+ * 2. 智能处理 Docker 的 library/ 命名空间补全。
+ * 3. Linux 软件源加速，支持 debian-security 及 Range 断点续传。
+ * 4. 双模式通用代理 (Raw / Recursive)。
+ * 5. 递归模式集成 Cache API，极大提升脚本二次访问速度。
+ * 6. Dashboard: 递归加速模块样式与 GitHub 文件加速模块完全一致。
+ * 7. [新增] 集成 geoip-lite，支持 ALLOW_COUNTRIES 国家级访问控制。
+ * 8. [新增] ALLOW_REFERER 免密访问 (支持域名/URL前缀匹配)。
+ * 9. [新增] 管理员 IP (ADMIN_IPS) 免密访问 Dashboard 和代理路径。
+ * 10. [优化] 自动修复浏览器合并斜杠问题 (https:/ip.sb -> https://ip.sb)。
  * -----------------------------------------------------------------------------------------
  */
 
@@ -15,7 +21,7 @@ const path = require('path');
 const fs = require('fs');
 
 // --- 1. 智能加载配置 (.env) ---
-// 优先查找二进制文件同级目录下的 .env，如果没有则查找当前源码目录
+// 逻辑: 优先查找可执行文件同级目录下的 .env，如果没有则查找当前源码目录
 const envPath = process.pkg 
     ? path.join(path.dirname(process.execPath), '.env') 
     : path.join(__dirname, '.env');
@@ -24,7 +30,7 @@ if (fs.existsSync(envPath)) {
     console.log(`[Config] Loading config from: ${envPath}`);
     require('dotenv').config({ path: envPath });
 } else {
-    // 兼容 Docker 环境
+    // 兼容 Docker 环境 (环境变量直接注入)
     require('dotenv').config(); 
 }
 
@@ -32,22 +38,24 @@ const express = require('express');
 const NodeCache = require('node-cache');
 const http = require('http');
 const https = require('https');
+// [新增] 引入 GeoIP 库，用于查询 IP 归属地
+const geoip = require('geoip-lite');
 
-// --- 初始化 ---
+// --- 初始化 Express 和 缓存 ---
 const app = express();
-// 默认缓存 1 小时
+// 读取 CACHE_TTL 环境变量，默认 3600 秒
 const cacheTTL = parseInt(process.env.CACHE_TTL || "3600");
 const myCache = new NodeCache({ stdTTL: cacheTTL }); 
 const PORT = process.env.PORT || 21011; 
 
-// --- 内存级频率限制存储 (替代 Cloudflare KV) ---
+// --- 内存级频率限制存储 (替代 Cloudflare KV/D1) ---
 const rateLimitStore = new Map();
 
 // ==============================================================================
 // 2. 全局配置定义
 // ==============================================================================
 
-// 辅助函数: 将逗号或换行符分隔的字符串解析为数组
+// 辅助函数: 将逗号或换行符分隔的字符串解析为数组，并去空
 const parseList = (val, defaultVal) => {
     const source = val || defaultVal || "";
     return source.split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
@@ -61,29 +69,35 @@ const CONFIG = {
     CACHE_TTL: cacheTTL,
     
     // --- 访问控制 (安全设置) ---
-    BLACKLIST: parseList(process.env.BLACKLIST, ""),
-    WHITELIST: parseList(process.env.WHITELIST, ""),
-    ALLOW_IPS: parseList(process.env.ALLOW_IPS, ""),
-    ALLOW_COUNTRIES: parseList(process.env.ALLOW_COUNTRIES, ""), // VPS版暂未集成GeoIP库，预留
+    BLACKLIST: parseList(process.env.BLACKLIST, ""),           // 黑名单域名
+    WHITELIST: parseList(process.env.WHITELIST, ""),           // 白名单域名 (设置后仅允许这些)
+    ALLOW_IPS: parseList(process.env.ALLOW_IPS, ""),           // 允许访问的客户端 IP (白名单)
+    
+    // [新增] 允许的国家代码 (如 CN, US, JP, HK)
+    // 如果设置了此项，只有来自这些国家的 IP 才能访问
+    ALLOW_COUNTRIES: parseList(process.env.ALLOW_COUNTRIES, ""), 
     
     // --- 免密访问增强 ---
     // 格式: "github.com" (域名) 或 "https://github.com/User" (完整前缀)
+    // 允许特定的来源网站免密码调用本代理
     ALLOW_REFERER: process.env.ALLOW_REFERER || "",
 
     // --- 额度限制 ---
     DAILY_LIMIT_COUNT: parseInt(process.env.DAILY_LIMIT_COUNT || "200"),
     
     // --- 权限管理 ---
+    // 管理员 IP: 拥有重置额度权限，且访问代理时免密码
     ADMIN_IPS: parseList(process.env.ADMIN_IPS, "127.0.0.1"),
+    // 免限额 IP: 这些 IP 访问不计入每日限额
     IP_LIMIT_WHITELIST: parseList(process.env.IP_LIMIT_WHITELIST, "127.0.0.1"),
 };
 
-// 打印关键配置
+// 打印关键配置信息到控制台
 console.log("---------------------------------------");
 console.log(`ProxyX Server Starting on Port ${PORT}`);
 console.log(`PASSWORD: ${CONFIG.PASSWORD}`);
 console.log(`ADMIN_IPS: ${JSON.stringify(CONFIG.ADMIN_IPS)}`);
-console.log(`ALLOW_REFERER: ${CONFIG.ALLOW_REFERER ? 'Configured' : 'None'}`);
+console.log(`GeoIP Check: ${CONFIG.ALLOW_COUNTRIES.length > 0 ? 'Enabled (' + CONFIG.ALLOW_COUNTRIES.join(',') + ')' : 'Disabled'}`);
 console.log("---------------------------------------");
 
 // Docker 上游配置
@@ -120,35 +134,43 @@ const LIGHTNING_SVG = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3
 // 3. 中间件与工具函数
 // ==============================================================================
 
+// 获取客户端真实 IP
 const getClientIP = (req) => {
-    return req.headers['x-forwarded-for'] || req.socket.remoteAddress || '0.0.0.0';
+    // 优先从 CF-Connecting-IP 获取 (如果套了 Cloudflare CDN)
+    // 否则用 X-Forwarded-For (反代)，最后用直连 IP
+    const ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket.remoteAddress || '0.0.0.0';
+    // 处理 IPv6 映射格式 (::ffff:1.2.3.4 -> 1.2.3.4)
+    return ip.replace(/^.*:/, ''); 
 };
 
+// 获取今日日期字符串 (用于限额 key)
 const getDate = () => new Date(new Date().getTime() + 28800000).toISOString().split('T')[0];
 
-// 速率限制中间件
+// 中间件: 每日速率限制
 const checkRateLimit = (req, res, next) => {
     const ip = getClientIP(req);
-    // 白名单跳过检查
+    
+    // 白名单 IP 跳过检查
     if (CONFIG.IP_LIMIT_WHITELIST.includes(ip)) return next();
     
-    // 静态资源跳过
+    // 静态资源跳过检查
     if (req.path === '/' || req.path === '/favicon.ico' || req.path === '/robots.txt') return next();
 
     const today = getDate();
     const key = `${ip}:${today}`;
     const count = rateLimitStore.get(key) || 0;
 
+    // 超过限额
     if (count >= CONFIG.DAILY_LIMIT_COUNT) {
         return res.status(429).send(`⚠️ Daily Limit Exceeded: ${count}/${CONFIG.DAILY_LIMIT_COUNT}`);
     }
     
-    // 简单计数 (VPS版内存存储)
+    // 简单计数 (每请求一次 +1，实际生产环境可优化为请求成功后计数)
     rateLimitStore.set(key, count + 1);
     next();
 };
 
-// CORS 设置
+// 中间件: 设置 CORS 头
 app.use((req, res, next) => {
     res.header("Access-Control-Allow-Origin", "*");
     res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD");
@@ -158,17 +180,40 @@ app.use((req, res, next) => {
     next();
 });
 
-// IP 黑白名单检查
+// [核心功能] 中间件: 访问控制 (IP 白名单 + GeoIP 国家限制)
 app.use((req, res, next) => {
     const ip = getClientIP(req);
-    if (CONFIG.ALLOW_IPS.length > 0 && !CONFIG.ALLOW_IPS.includes(ip)) {
-        return res.status(403).send('Access Denied (IP Not Allowed)');
+
+    // 1. IP 白名单检查 (优先级最高)
+    // 如果设置了 ALLOW_IPS，不在列表中的 IP 直接拒绝
+    if (CONFIG.ALLOW_IPS.length > 0) {
+        if (!CONFIG.ALLOW_IPS.includes(ip)) {
+            return res.status(403).send(`Access Denied (IP ${ip} Not Allowed)`);
+        }
     }
+
+    // 2. GeoIP 国家检查
+    // 如果设置了 ALLOW_COUNTRIES，查询 IP 归属地并检查
+    if (CONFIG.ALLOW_COUNTRIES.length > 0) {
+        // 跳过内网 IP / 本地回环
+        if (ip === '127.0.0.1' || ip === 'localhost' || ip.startsWith('192.168.') || ip.startsWith('10.')) {
+            return next(); 
+        }
+
+        const geo = geoip.lookup(ip);
+        const country = geo ? geo.country : "XX"; // 获取不到归属地则标记为 XX
+
+        if (!CONFIG.ALLOW_COUNTRIES.includes(country)) {
+            console.log(`[Block] IP: ${ip} | Country: ${country} | Not in allowed list: ${CONFIG.ALLOW_COUNTRIES}`);
+            return res.status(403).send(`Access Denied (Country ${country} Not Allowed)`);
+        }
+    }
+
     next();
 });
 
 app.use(checkRateLimit);
-// 解析 raw body，支持大文件流式传输
+// 解析 raw body，支持大文件流式传输，限制 50mb (主要针对上传，下载流不受此限)
 app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
 // ==============================================================================
@@ -179,10 +224,12 @@ app.get('/robots.txt', (req, res) => res.type('text/plain').send("User-agent: *\
 app.get('/favicon.ico', (req, res) => res.type('image/svg+xml').send(LIGHTNING_SVG));
 
 // --- 4.1 Docker Token 认证 ---
+// 处理 Docker 客户端的登录/拉取令牌请求
 app.get('/token', async (req, res) => {
     const scope = req.query.scope;
     let upstreamAuthUrl = 'https://auth.docker.io/token';
     
+    // 根据 scope 判断请求的是哪个 Registry (如 ghcr.io)
     for (const [domain, _] of Object.entries(REGISTRY_MAP)) {
         if (scope && scope.includes(domain)) {
             upstreamAuthUrl = `https://${domain}/token`;
@@ -193,6 +240,7 @@ app.get('/token', async (req, res) => {
     const newUrl = new URL(upstreamAuthUrl);
     newUrl.search = new URLSearchParams(req.query).toString();
 
+    // Docker Hub 特殊处理：补全 library/
     if (upstreamAuthUrl === 'https://auth.docker.io/token') {
         newUrl.searchParams.set('service', 'registry.docker.io');
         if (scope && scope.startsWith('repository:')) {
@@ -222,6 +270,7 @@ app.get('/token', async (req, res) => {
 });
 
 // --- 4.2 Docker V2 API ---
+// 处理实际的 Docker 镜像层下载请求
 app.use('/v2', async (req, res) => {
     let path = req.path;
     if (path === '/') path = '';
@@ -236,6 +285,7 @@ app.use('/v2', async (req, res) => {
                 method: req.method, 
                 headers: req.headers 
             });
+            // 处理 401 认证跳转
             if (rootReq.status === 401) {
                 const wwwAuth = rootReq.headers.get('WWW-Authenticate');
                 if (wwwAuth) {
@@ -248,7 +298,7 @@ app.use('/v2', async (req, res) => {
         } catch (e) { return res.status(500).send(e.message); }
     }
 
-    // 路径修正
+    // 路径修正与 Registry 识别
     const pathParts = path.replace(/^\//, '').split('/');
     if (REGISTRY_MAP[pathParts[0]]) {
         targetDomain = pathParts[0];
@@ -280,6 +330,7 @@ app.use('/v2', async (req, res) => {
             redirect: 'manual'
         });
 
+        // 401 认证处理
         if (response.status === 401) {
             const wwwAuth = response.headers.get('WWW-Authenticate');
             if (wwwAuth) {
@@ -289,6 +340,7 @@ app.use('/v2', async (req, res) => {
             return res.status(401).send(await response.text());
         }
 
+        // 302 重定向处理 (Blob 下载)
         if ([301, 302, 303, 307, 308].includes(response.status)) {
             const location = response.headers.get('Location');
             if (location) {
@@ -320,17 +372,17 @@ app.use('/v2', async (req, res) => {
 });
 
 // --- 4.3 通用代理入口 (核心逻辑) ---
-// 为了支持免密访问 (如 /ubuntu 而不需要 /password/ubuntu)，我们捕获所有请求并手动解析
+// 捕获所有其他请求，处理 Linux源、GitHub加速、通用文件代理
 app.all('*', async (req, res) => {
     const clientIP = getClientIP(req);
     const referer = req.headers['referer'] || "";
     const path = req.path;
 
     // --- 认证与信任判断 ---
-    // 1. 判断是否为管理员 IP
+    // 1. 判断是否为管理员 IP (免密)
     const isAdminIp = CONFIG.ADMIN_IPS.includes(clientIP);
 
-    // 2. 判断 Referer 是否在允许列表中
+    // 2. 判断 Referer 是否在允许列表中 (免密)
     let isTrustedReferer = false;
     if (CONFIG.ALLOW_REFERER && referer) {
         const allowedRules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s => s.trim()).filter(s => s);
@@ -343,10 +395,12 @@ app.all('*', async (req, res) => {
             else {
                 try {
                     const refUrl = new URL(referer);
+                    // 允许完全匹配或子域名
                     if (refUrl.hostname === rule || refUrl.hostname.endsWith("." + rule)) {
                         isTrustedReferer = true; break;
                     }
                 } catch(e) {
+                    // 容错：简单的字符串包含
                     if (referer.includes(rule)) { isTrustedReferer = true; break; }
                 }
             }
@@ -360,7 +414,6 @@ app.all('*', async (req, res) => {
     let isAuthenticated = false;
 
     // 解析路径结构: /密码/目标URL
-    // 例如: /123456/https://google.com  => password=123456, target=https://google.com
     const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
 
     // 认证方式 A: URL 携带正确密码
@@ -372,7 +425,6 @@ app.all('*', async (req, res) => {
     else if (isTrusted) {
         isAuthenticated = true;
         // 免密模式下，整个 Path 去掉开头的 / 就是目标路径
-        // 例如访问 /ubuntu/xxx，subPath 就是 ubuntu/xxx
         subPath = path.substring(1); 
     }
 
@@ -450,7 +502,7 @@ app.all('*', async (req, res) => {
         targetUrlStr = subPath.replace(/^r\/?/, "");
     }
 
-    // [2] 自动修正 URL (浏览器合并双斜杠修复)
+    // [2] 自动修正 URL (核心修复：解决浏览器合并双斜杠问题)
     if (!targetUrlStr.startsWith("http")) {
         targetUrlStr = 'https://' + targetUrlStr;
     } else {
@@ -489,7 +541,7 @@ app.all('*', async (req, res) => {
         const headers = { ...req.headers };
         delete headers['host'];
         delete headers['connection'];
-        // 伪装 UA
+        // 伪装 UA 防止被拒绝
         if (!headers['user-agent']) headers['user-agent'] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
         const upstreamRes = await fetch(targetUrlStr, {
@@ -501,6 +553,7 @@ app.all('*', async (req, res) => {
 
         res.status(upstreamRes.status);
         upstreamRes.headers.forEach((v, k) => {
+            // 递归模式下，这些头会导致修改后的 body 长度不匹配，必须删除
             if (proxyMode === 'recursive' && (k === 'content-encoding' || k === 'content-length' || k === 'transfer-encoding')) return;
             res.setHeader(k, v);
         });
@@ -508,22 +561,23 @@ app.all('*', async (req, res) => {
         res.setHeader('X-Proxy-Mode', proxyMode === 'recursive' ? 'Recursive-Force-Text' : 'Raw-Passthrough');
         res.removeHeader('content-security-policy');
 
-        // A. Raw 模式
+        // A. Raw 模式：直接透传二进制流
         if (proxyMode === 'raw') {
             const arrayBuffer = await upstreamRes.arrayBuffer();
             res.send(Buffer.from(arrayBuffer));
             return;
         }
 
-        // B. 递归模式
+        // B. 递归模式：文本替换
         if (proxyMode === 'recursive') {
             let text = await upstreamRes.text();
             
             const workerOrigin = `${req.protocol}://${req.get('host')}`;
-            // 如果是免密访问，递归前缀不需要密码；如果是密码访问，加上密码
+            // 构造代理前缀：如果是免密访问且未使用密码路径，前缀就不带密码；否则带密码
             const prefixPath = (isTrusted && !path.startsWith('/' + CONFIG.PASSWORD)) ? '' : `/${CONFIG.PASSWORD}`;
             const proxyBase = `${workerOrigin}${prefixPath}/r/`;
 
+            // 正则替换 http/https 链接，加上代理前缀
             const regex = /(https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))/g;
             
             text = text.replace(regex, (match) => {
@@ -531,6 +585,7 @@ app.all('*', async (req, res) => {
                 return proxyBase + match;
             });
 
+            // 写入缓存
             if (CONFIG.ENABLE_CACHE && upstreamRes.status === 200) {
                 myCache.set(cacheKey, text);
             }
@@ -550,7 +605,7 @@ app.listen(PORT, () => {
 
 
 // ==============================================================================
-// 5. Dashboard HTML 渲染 (已更新到最新版 UI)
+// 5. Dashboard HTML 渲染 (完整未压缩)
 // ==============================================================================
 function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     const percent = Math.min(Math.round((count / limit) * 100), 100);
@@ -567,6 +622,7 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(LIGHTNING_SVG)}">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
+/* CSS: Uncompressed as requested */
 body {
   min-height: 100vh;
   display: flex;
@@ -578,7 +634,7 @@ body {
   margin: 0;
 }
 
-/* ========== Light Mode ========== */
+/* Light Mode */
 .light-mode {
   background-color: #f3f4f6;
   color: #1f293b;
@@ -614,7 +670,7 @@ body {
   border: 1px solid #fca5a5;
 }
 
-/* ========== Dark Mode ========== */
+/* Dark Mode */
 .dark-mode {
   background-color: #0f172a;
   color: #e2e8f0;
@@ -660,7 +716,7 @@ body {
   background-color: #f1f5f9;
 }
 
-/* ========== Common Styles ========== */
+/* Common */
 .code-area,
 pre,
 .select-all {
@@ -686,7 +742,6 @@ pre,
   z-index: 1;
 }
 
-/* ========== Responsive ========== */
 @media (max-width: 768px) {
   .custom-content-wrapper {
     width: 100% !important;
@@ -707,7 +762,6 @@ pre,
   }
 }
 
-/* ========== Top Navigation ========== */
 .top-nav {
   position: fixed;
   top: 1.5rem;
@@ -748,7 +802,6 @@ pre,
   background: rgba(255, 255, 255, 0.2);
 }
 
-/* ========== Toast ========== */
 .toast {
   position: fixed;
   bottom: 3rem;
@@ -774,7 +827,6 @@ pre,
   transform: translateX(-50%) translateY(0);
 }
 
-/* ========== Inputs ========== */
 input,
 select {
   outline: none;
@@ -794,7 +846,6 @@ select:focus {
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
 }
 
-/* ========== Modal ========== */
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -1020,7 +1071,7 @@ select:focus {
  
       <div class="section-box">
           <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
-              <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+              <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
               镜像源配置 (Daemon.json)
           </h2>
           <div class="code-area rounded-lg p-4 overflow-x-auto text-sm">
