@@ -11,20 +11,20 @@ services:
 
     environment:
       # --- 基础配置 ---
-      - PORT=21011
-      - PASSWORD=123456
-      - MAX_REDIRECTS=5
-      - ENABLE_CACHE=true
-      - CACHE_TTL=3600
+      - PORT=21011                  # 监听端口
+      - PASSWORD=123456             # 访问密码
+      - MAX_REDIRECTS=5             # 最大跳转次数
+      - ENABLE_CACHE=true           # 是否开启缓存
+      - CACHE_TTL=3600              # 缓存时长(秒)
       
       # --- 访问控制 ---
-      - BLACKLIST=
-      - WHITELIST=
-      - ALLOW_IPS=
-      - ALLOW_COUNTRIES=
+      - BLACKLIST=                  # 黑名单
+      - WHITELIST=                  # 白名单
+      - ALLOW_IPS=                  # 允许的IP
+      - ALLOW_COUNTRIES=            # 允许的国家/地区
       
       # --- 额度与权限 ---
-      - DAILY_LIMIT_COUNT=200
-      - ADMIN_IPS=127.0.0.1
-      - IP_LIMIT_WHITELIST=127.0.0.1
-      - ALLOW_REFERER=github.com,nodeseek.com
+      - DAILY_LIMIT_COUNT=200       # 每日额度
+      - ADMIN_IPS=127.0.0.1         # 管理员IP
+      - IP_LIMIT_WHITELIST=127.0.0.1 # IP白名单
+      - ALLOW_REFERER=github.com,nodeseek.com # 允许的来源域名
