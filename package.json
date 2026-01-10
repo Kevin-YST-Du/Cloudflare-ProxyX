@@ -1,7 +1,7 @@
 {
   "name": "proxyx",
-  "version": "4.3.0",
-  "description": "Ultimate Docker & Linux Recursive Proxy Server",
+  "version": "4.8.0",
+  "description": "Ultimate Docker & Linux Recursive Proxy Server with GeoIP",
   "main": "src/server.js",
   "bin": "src/server.js",
   "scripts": {
@@ -13,7 +13,8 @@
       "src/**/*.js"
     ],
     "assets": [
-      "node_modules/**/*"
+      "node_modules/**/*",
+      "node_modules/geoip-lite/data/**/*"
     ],
     "targets": [
       "node18-linux-x64",
@@ -26,7 +27,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "node-cache": "^5.1.2",
-    "dotenv": "^16.3.1"
+    "dotenv": "^16.3.1",
+    "geoip-lite": "^1.4.10"
   },
   "devDependencies": {
     "pkg": "^5.8.1"
