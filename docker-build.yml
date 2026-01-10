@@ -3,7 +3,6 @@ version: '3.8'
 services:
   proxy:
     build: .
-    
     container_name: proxyx
     restart: always
     
@@ -11,21 +10,21 @@ services:
     network_mode: "host"
 
     environment:
+      # --- 基础配置 ---
       - PORT=21011
       - PASSWORD=123456
       - MAX_REDIRECTS=5
       - ENABLE_CACHE=true
       - CACHE_TTL=3600
       
-      # 访问控制
+      # --- 访问控制 ---
       - BLACKLIST=
       - WHITELIST=
       - ALLOW_IPS=
       - ALLOW_COUNTRIES=
       
-      # 限制
+      # --- 额度与权限 ---
       - DAILY_LIMIT_COUNT=200
-      
-      # 权限管理
-      - ADMIN_IPS=127.0.0.1,你的服务器公网IP
+      - ADMIN_IPS=127.0.0.1
       - IP_LIMIT_WHITELIST=127.0.0.1
+      - ALLOW_REFERER=github.com,nodeseek.com
