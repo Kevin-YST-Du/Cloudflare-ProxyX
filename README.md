@@ -36,7 +36,28 @@
 
 ## 🛠️ 部署方法
 
-### 1. 部署代码
+# docker部署
+```
+git clone https://github.com/Kevin-YST-Du/Cloudflare-ProxyX.git #git我的仓库
+cd Cloudflare-ProxyX # 进入我的目录
+docker compose up -d # 运行容器
+docker-compose up -d # 运行容器（docker如果是低版本的运行这个命令）
+```
+---
+# 一键脚本安装
+```
+git clone https://dl.spacenb.com/dugh1213/https://github.com/Kevin-YST-Du/Cloudflare-ProxyX.git && cd Cloudflare-ProxyX && bash install.sh
+```
+---
+# 二进制安装
+```
+git clone https://github.com/Kevin-YST-Du/Cloudflare-ProxyX.git #git我的仓库
+cd Cloudflare-ProxyX # 进入我的目录
+wget https://github.com/Kevin-YST-Du/Cloudflare-ProxyX/releases/download/v3.1.0/proxyx-linux-x64 #下载最新版本的二进制包
+bash install-binary.sh
+```
+---
+### 1. Cloudflare部署代码
 #### 1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/)。
 #### 2. 进入 **Workers & Pages** -> **Create Application** -> **Create Worker**。
 #### 3. 命名你的 Worker（例如 `docker-accel`），点击 **Deploy**。
@@ -61,7 +82,7 @@
 | `IP_LIMIT_WHITELIST` | 免额度 IP 白名单 (请求不计入每日限额)| `127.0.0.1` | 否 |
 
 
-# 📦 重点：KV 命名空间绑定
+# 📦 重点：KV 命名空间绑定 D1数据库绑定（二选一即可）
 # 1. 为什么要绑定 KV？
 ## 持久化存储：如果不绑定 KV，所有的计数（IP 请求数）都存在内存中。Worker 闲置或重启后，计数会清零，导致限额功能失效。
 ## 全站统计：绑定 KV 后，管理员可以跨 session 查看今天所有 IP 的访问记录和总请求量。
@@ -83,6 +104,23 @@
 ## Web 面板中的“全站统计”将无法获取历史数据，只能看到当前瞬间的内存状态。
 ## *(注：如果未设置环境变量，代码将使用文件顶部的 `DEFAULT_CONFIG` 默认值)*
 
+# D1数据库绑定
+## 在 Cloudflare 后台找到存储和数据库
+## 创建一个D1数据库
+## 执行以下 SQL 初始化表结构
+```
+DROP TABLE IF EXISTS ip_limits;
+CREATE TABLE IF NOT EXISTS ip_limits (
+    ip TEXT,
+    date TEXT,
+    count INTEGER DEFAULT 0,
+    updated_at INTEGER,
+    PRIMARY KEY (ip, date)
+);
+CREATE INDEX IF NOT EXISTS idx_date_count ON ip_limits(date, count DESC);
+```
+## 并在Workers和Pages找到部署的Workers中绑定
+## 变量名设为 DB
 ## 另外的文件为混淆版本
 ---
 
