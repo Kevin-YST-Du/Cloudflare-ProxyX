@@ -46,7 +46,9 @@ docker-compose up -d # 运行容器（docker如果是低版本的运行这个命
 ---
 # 一键脚本安装
 ```
-git clone https://dl.spacenb.com/dugh1213/https://github.com/Kevin-YST-Du/Cloudflare-ProxyX.git && cd Cloudflare-ProxyX && bash install.sh
+git clone https://github.com/Kevin-YST-Du/Cloudflare-ProxyX.git #git我的仓库
+cd Cloudflare-ProxyX # 进入我的目录
+bash install.sh # 执行一键安装
 ```
 ---
 # 二进制安装
