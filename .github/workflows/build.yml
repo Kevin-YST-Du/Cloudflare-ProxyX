@@ -7,7 +7,7 @@ on:
       tag_name:
         description: 'Tag name for image (optional, e.g., v1.0.1)'
         required: false
-        default: ''
+        default: 'v3.0.0'
   
   # 2. 推送 v* 标签时触发 (如 v1.0.0)
   push:
