@@ -768,7 +768,7 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw', c
 }
 
 // ==============================================================================
-// 4. Dashboard 渲染 (UI 界面)
+// 4. Dashboard 渲染 (UI 界面 - 最终修复版: 递归模块仓库路径修正)
 // ==============================================================================
 
 function renderDashboard(hostname, password, ip, count, limit, adminIps) {
@@ -1129,23 +1129,34 @@ select:focus {
       <div class="section-box">
         <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
           <svg class="w-5 h-5 text-gray-700 dark:text-gray-300" fill="currentColor" viewBox="0 0 24 24"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
-          GitHub 文件加速 (Raw 纯净模式)
+          GitHub 文件 / 脚本命令加速 (智能识别)
         </h2>
         <div class="flex flex-responsive gap-3">
-          <input id="github-url" type="text" placeholder="粘贴 https://github.com/... 链接" class="flex-grow p-3.5 rounded-lg text-sm">
+          <input id="github-url" type="text" placeholder="粘贴 链接 或 bash/curl/git 完整命令" class="flex-grow p-3.5 rounded-lg text-sm">
           <button onclick="convertGithubUrl()" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3.5 rounded-lg transition font-bold text-sm shadow-md whitespace-nowrap flex items-center justify-center gap-1">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"/></svg>
               获取链接
           </button>
         </div>
+        
         <div id="github-result-box" class="hidden mt-5">
-          <div class="p-4 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-100 dark:border-emerald-800 rounded-lg mb-3">
-               <p id="github-result" class="text-emerald-700 dark:text-emerald-400 font-mono text-xs break-all select-all"></p>
-          </div>
-          <div class="flex gap-3">
-              <button id="btn-copy-github" onclick="copyGithubUrl()" class="flex-1 bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition">复制链接</button>
-              <button onclick="openGithubUrl()" class="flex-1 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100 dark:hover:bg-blue-900/40 text-blue-600 dark:text-blue-400 py-2.5 rounded-lg text-xs font-bold transition">立即访问</button>
-          </div>
+           <div class="mb-6">
+               <p class="text-xs font-bold text-gray-500 dark:text-gray-400 mb-2 uppercase tracking-wide">1. 加速链接 (Raw URL):</p>
+               <div class="p-4 bg-emerald-50 dark:bg-emerald-900/20 border border-emerald-100 dark:border-emerald-800 rounded-lg mb-3">
+                   <p id="github-result-url" class="text-emerald-700 dark:text-emerald-400 font-mono text-xs break-all select-all"></p>
+               </div>
+               <div class="flex gap-3">
+                   <button onclick="copyGithubUrlOnly()" class="flex-1 bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition">复制链接</button>
+                   <button onclick="openGithubUrl()" class="flex-1 bg-blue-50 dark:bg-blue-900/20 hover:bg-blue-100 dark:hover:bg-blue-900/40 text-blue-600 dark:text-blue-400 py-2.5 rounded-lg text-xs font-bold transition">立即访问</button>
+               </div>
+           </div>
+           <div>
+               <p id="github-cmd-label" class="text-xs font-bold text-gray-500 dark:text-gray-400 mb-2 uppercase tracking-wide">2. 终端命令:</p>
+               <div class="p-4 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg mb-3">
+                  <p id="github-result-cmd" class="text-slate-700 dark:text-slate-300 font-mono text-xs break-all select-all"></p>
+               </div>
+               <button onclick="copyGithubCmd()" class="w-full bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition">复制命令</button>
+           </div>
         </div>
       </div>
 
@@ -1155,7 +1166,7 @@ select:focus {
         </h2>
         <p class="text-xs opacity-60 mb-3">适用于 <code>curl | bash</code> 脚本。系统会强制重写脚本内部的所有下载链接。</p>
         <div class="flex flex-responsive gap-3">
-          <input id="recursive-url" type="text" placeholder="如: https://get.docker.com" class="flex-grow p-3.5 rounded-lg text-sm">
+          <input id="recursive-url" type="text" placeholder="如: https://get.docker.com 或粘贴 bash <(curl ...)" class="flex-grow p-3.5 rounded-lg text-sm">
           <button onclick="convertRecursiveUrl()" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3.5 rounded-lg transition font-bold text-sm shadow-md whitespace-nowrap flex items-center justify-center gap-1">
                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.384-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"/></svg>
                生成命令
@@ -1174,7 +1185,7 @@ select:focus {
                  </div>
              </div>
              <div>
-                 <p class="text-xs font-bold text-gray-500 dark:text-gray-400 mb-2 uppercase tracking-wide">2. 终端命令 (Bash):</p>
+                 <p id="recursive-cmd-label" class="text-xs font-bold text-gray-500 dark:text-gray-400 mb-2 uppercase tracking-wide">2. 终端命令 (Bash):</p>
                  <div class="p-4 bg-slate-100 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 rounded-lg mb-3">
                     <p id="recursive-result-cmd" class="text-slate-700 dark:text-slate-300 font-mono text-xs break-all select-all"></p>
                  </div>
@@ -1228,7 +1239,7 @@ select:focus {
   
       <div class="section-box">
           <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
-              <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+              <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
               镜像源配置 (Daemon.json)
           </h2>
           <div class="code-area rounded-lg p-4 overflow-x-auto text-sm">
@@ -1295,6 +1306,8 @@ select:focus {
           
           let githubAcceleratedUrl = '';
           let githubOpenUrl = '';
+          let githubCommand = ''; 
+
           let recursiveCommand = '';
           let recursiveUrlOnly = '';
           let dockerCommand = '';
@@ -1361,60 +1374,144 @@ select:focus {
             catch (err) { document.body.removeChild(textArea); return Promise.reject(err); }
           }
   
-          // --- 业务逻辑: GitHub 加速 ---
+          // ======================================================================
+          // 核心逻辑: GitHub/通用加速 (智能识别 Git Clone vs Wget)
+          // ======================================================================
           window.convertGithubUrl = function() {
             let input = document.getElementById('github-url').value.trim();
-            if (!input) return window.showToast('❌ 请输入链接', true);
-            if (!input.startsWith('http')) { input = 'https://' + input; }
-            
-            const prefix = window.location.origin + '/' + window.WORKER_PASSWORD + '/';
-            const copyBtn = document.getElementById('btn-copy-github');
-            
-            const repoRegex = /^https?:\\/\\/(?:www\\.)?github\\.com\\/[^/]+\\/[^/]+(?:\\.git)?\\/?$/;
-            
-            if (input.endsWith('.git') || repoRegex.test(input)) {
-                const accUrl = prefix + input;
-                const gitCmd = 'git clone ' + accUrl;
-                document.getElementById('github-result').innerHTML = 
-                    '<span class="block mb-1 font-bold text-indigo-600">终端拉取命令:</span>' + gitCmd + 
-                    '<br><br><span class="block mb-1 font-bold text-indigo-600">加速链接 (Raw):</span>' + accUrl;
-                githubAcceleratedUrl = gitCmd; 
-                githubOpenUrl = accUrl;        
-                copyBtn.textContent = '复制命令';
-                window.showToast('✅ 已识别为仓库');
+            if (!input) return window.showToast('❌ 请输入内容', true);
+
+            const urlRegex = /(https?:\\/\\/[^\\s"'\)<>]+)/;
+            const match = input.match(urlRegex);
+            let originalUrl = "";
+
+            if (match) {
+                originalUrl = match[0];
             } else {
-                githubAcceleratedUrl = prefix + input;
-                githubOpenUrl = githubAcceleratedUrl;
-                document.getElementById('github-result').textContent = githubAcceleratedUrl;
-                copyBtn.textContent = '复制链接';
-                window.copyToClipboard(githubAcceleratedUrl).then(() => window.showToast('✅ 已复制到剪贴板'));
+                if (!input.includes(' ')) {
+                    originalUrl = 'https://' + input;
+                } else {
+                    return window.showToast('❌ 无法识别有效链接', true);
+                }
             }
+
+            const prefix = window.location.origin + '/' + window.WORKER_PASSWORD + '/';
+            const proxiedUrl = prefix + originalUrl;
+
+            let finalCommand = "";
+            let label = "";
+
+            // 判断是否为纯链接
+            const isPureUrl = (input === match?.[0]) || (('https://' + input) === originalUrl);
+            
+            // 【新增】判断是否为 GitHub 仓库主页 (而非文件)
+            // 匹配: github.com/user/repo 或 github.com/user/repo.git
+            // 排除: /blob/ 等路径
+            const repoRegex = /^https?:\\/\\/(?:www\\.)?github\\.com\\/[^\\/]+\\/[^\\/]+(?:\\.git)?\\/?$/;
+
+            if (isPureUrl) {
+                if (repoRegex.test(originalUrl)) {
+                    // 场景 A: 是仓库主页 -> Git Clone
+                    finalCommand = 'git clone ' + proxiedUrl;
+                    label = "终端命令 (Git Clone):";
+                    window.showToast('✅ 已识别为仓库');
+                } else {
+                    // 场景 B: 是具体文件 -> Wget
+                    const fileName = originalUrl.split('/').pop() || 'download';
+                    finalCommand = 'wget -c -O "' + fileName + '" "' + proxiedUrl + '"';
+                    label = "终端命令 (Wget):";
+                    window.showToast('✅ 已生成 Wget 命令');
+                }
+            } else {
+                // 场景 C: 是完整命令 -> 替换链接
+                finalCommand = input.replace(originalUrl, proxiedUrl);
+                label = "终端命令 (自动替换):";
+                window.showToast('✅ 已替换命令中的链接');
+            }
+
+            githubAcceleratedUrl = proxiedUrl;
+            githubOpenUrl = proxiedUrl;
+            githubCommand = finalCommand; 
+
+            document.getElementById('github-result-url').textContent = proxiedUrl;
+            document.getElementById('github-cmd-label').textContent = "2. " + label;
+            document.getElementById('github-result-cmd').textContent = finalCommand;
+            
             document.getElementById('github-result-box').classList.remove('hidden');
           }
           
-          window.copyGithubUrl = function() { window.copyToClipboard(githubAcceleratedUrl).then(() => window.showToast('✅ 已复制')); }
+          window.copyGithubUrlOnly = function() { window.copyToClipboard(githubAcceleratedUrl).then(() => window.showToast('✅ 链接已复制')); }
           window.openGithubUrl = function() { window.open(githubOpenUrl, '_blank'); }
+          window.copyGithubCmd = function() { window.copyToClipboard(githubCommand).then(() => window.showToast('✅ 命令已复制')); }
 
-          // --- 业务逻辑: 递归脚本加速 ---
+          // ======================================================================
+          // 核心逻辑: 递归脚本加速 (Wget/Bash/Git Clone 智能三合一)
+          // ======================================================================
           window.convertRecursiveUrl = function() {
             let input = document.getElementById('recursive-url').value.trim();
             if (!input) return window.showToast('❌ 请输入链接', true);
-            if (!input.startsWith('http')) { input = 'https://' + input; }
             
-            const prefix = window.location.origin + '/' + window.WORKER_PASSWORD + '/r/';
-            const fullUrl = prefix + input;
+            // 1. 提取 URL
+            const urlMatch = input.match(/(https?:\\/\\/[^\\s"'\)]+)/);
+            let targetUrl = input;
+            if (urlMatch) {
+                targetUrl = urlMatch[0]; 
+            } else {
+                if (!targetUrl.startsWith('http')) { targetUrl = 'https://' + targetUrl; }
+            }
             
-            recursiveUrlOnly = fullUrl;
-            recursiveCommand = 'bash <(curl -sL ' + fullUrl + ')';
+            // 2. 构造两种代理路径 (RawPath 用于 Git, RecursivePath 用于脚本)
+            const baseUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/';
+            const rawProxyUrl = baseUrl + targetUrl;      // 不带 /r/
+            const recursiveProxyUrl = baseUrl + 'r/' + targetUrl; // 带 /r/
+
+            // 3. 智能判断生成模式
+            const isCommand = input.includes('bash') || input.includes('curl') || input.includes('wget') || input.includes(' ');
+            const repoRegex = /^https?:\\/\\/(?:www\\.)?github\\.com\\/[^\\/]+\\/[^\\/]+(?:\\.git)?\\/?$/;
+
+            let label = "";
+            let displayUrl = recursiveProxyUrl; // 默认显示递归链接
+
+            if (isCommand && urlMatch) {
+                 // 场景 A: 完整命令 (如 curl | bash)
+                 // 如果命令中包含 'git clone'，或者 URL 是一个 repo，通常应该用 Raw Path
+                 if (input.includes('git clone') || repoRegex.test(targetUrl)) {
+                     recursiveCommand = input.replace(targetUrl, rawProxyUrl);
+                     displayUrl = rawProxyUrl;
+                 } else {
+                     recursiveCommand = input.replace(targetUrl, recursiveProxyUrl);
+                 }
+                 label = "终端命令 (自动替换):";
+                 window.showToast('✅ 已替换命令中的链接');
+            } else {
+                 // 场景 B: 纯链接
+                 if (repoRegex.test(targetUrl)) {
+                     // B1: 是 GitHub 仓库 -> Git Clone -> 【关键修复】使用 Raw Path (不带 /r/)
+                     recursiveCommand = 'git clone ' + rawProxyUrl;
+                     displayUrl = rawProxyUrl; 
+                     label = "终端命令 (Git Clone):";
+                     window.showToast('✅ 已识别为仓库 (Raw模式)');
+                 } else {
+                     // B2: 是普通文件/脚本 -> Wget -> 使用 Recursive Path (带 /r/)
+                     const fileName = targetUrl.split('/').pop() || 'script';
+                     recursiveCommand = 'wget -c -O "' + fileName + '" "' + recursiveProxyUrl + '"';
+                     displayUrl = recursiveProxyUrl;
+                     label = "终端命令 (Wget):";
+                     window.showToast('✅ 已生成 Wget 命令');
+                 }
+            }
+            
+            recursiveUrlOnly = displayUrl; // 更新复制按钮的目标
             
             document.getElementById('recursive-result-url').textContent = recursiveUrlOnly;
+            document.getElementById('recursive-cmd-label').textContent = "2. " + label; 
             document.getElementById('recursive-result-cmd').textContent = recursiveCommand;
             document.getElementById('recursive-result-box').classList.remove('hidden');
           }
           
           window.copyRecursiveUrlOnly = function() { window.copyToClipboard(recursiveUrlOnly).then(() => window.showToast('✅ 链接已复制')); }
           window.openRecursiveUrl = function() { window.open(recursiveUrlOnly, '_blank'); }
-          window.copyRecursiveCommand = function() { window.copyToClipboard(recursiveCommand).then(() => window.showToast('✅ 命令已复制')); }
+          window.copyRecursiveCmd = function() { window.copyToClipboard(recursiveCommand).then(() => window.showToast('✅ 命令已复制')); }
   
           // --- 业务逻辑: Docker 镜像 ---
           window.convertDockerImage = function() {
