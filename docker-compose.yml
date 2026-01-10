@@ -1,9 +1,9 @@
 version: '3.8'
 
 services:
-  proxy: 
-    # 使用 GitHub 镜像 (如果你想直接拉取)
-     image: ghcr.io/kevin-yst-du/proxyx
+  proxy:
+    # 使用 GitHub 镜像
+    image: ghcr.io/kevin-yst-du/proxyx
     
     container_name: proxy-vps
     restart: always
@@ -36,8 +36,8 @@ services:
 
       # [权限管理]
       # 管理员 IP (拥有重置额度、查看全站统计的权限)
-      # 多个 IP 用逗号分隔
-      - ADMIN_IPS=127.0.0.1,你的服务器公网IP
+      # 多个 IP 用逗号分隔，替换为你的真实 IP
+      - ADMIN_IPS=127.0.0.1
 
       # 免额度 IP 白名单 (这些 IP 请求不计入每日限制)
       - IP_LIMIT_WHITELIST=127.0.0.1
