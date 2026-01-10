@@ -1,27 +1,56 @@
 #!/bin/bash
 
 # =========================================================
-# ProxyX 全能卸载脚本
+# ProxyX 全能卸载脚本 (Pro UI版)
 # 兼容: Docker / Binary / Source (Node.js)
 # =========================================================
 
-# 定义颜色
+# --- 颜色与格式定义 ---
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+PLAIN='\033[0m'
+BOLD='\033[1m'
 
-echo -e "${RED}====================================================${NC}"
-echo -e "${RED}       ProxyX 全能卸载脚本 (Docker/Binary/Source)    ${NC}"
-echo -e "${RED}====================================================${NC}"
-echo "此脚本将执行以下操作："
-echo "1. 停止并删除 ProxyX 相关的 Docker 容器。"
-echo "2. 停止并删除 Systemd 后台服务 (proxyx, proxy-bin, proxy-node)。"
-echo "3. 永久删除安装目录 (/opt/proxyx) 和配置文件。"
+# --- 辅助函数：状态打印 ---
+print_info() {
+    printf "${BLUE}[INFO]${PLAIN} %-40s\n" "$1"
+}
+
+print_check() {
+    printf "${CYAN}[检查]${PLAIN} %-40s " "$1..."
+}
+
+print_found() {
+    printf "${YELLOW} -> 发现目标${PLAIN}\n"
+}
+
+print_not_found() {
+    printf "${GREEN} -> 未安装 (跳过)${PLAIN}\n"
+}
+
+print_action() {
+    printf "       ${RED}├─ [删除]${PLAIN} %-30s " "$1..."
+}
+
+print_success() {
+    printf "${GREEN}[ OK ]${PLAIN}\n"
+}
+
+# --- 脚本开始 ---
+clear
+echo -e "${RED}=============================================================${PLAIN}"
+echo -e "${RED}         ProxyX 全能卸载工具 (Docker/Systemd/File)          ${PLAIN}"
+echo -e "${RED}=============================================================${PLAIN}"
+echo "此脚本将彻底清理 ProxyX 的以下残留："
+echo " 1. 运行中的 Docker 容器及相关镜像"
+echo " 2. Systemd 系统服务 (守护进程)"
+echo " 3. 配置文件与安装目录 (/opt/proxyx 等)"
 echo ""
 
-read -p "⚠️  确认要执行卸载吗？(y/n): " confirm
+read -p "⚠️  确认要执行彻底卸载吗？(输入 y 确认): " confirm
 if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
     echo "操作已取消。"
     exit 0
@@ -32,92 +61,121 @@ echo ""
 # =========================================================
 # 1. 清理 Docker 部署
 # =========================================================
+echo -e "${BOLD}1. 正在扫描 Docker 环境...${PLAIN}"
+
 if command -v docker &> /dev/null; then
-    echo -e "${CYAN}🐳 正在检查 Docker 容器...${NC}"
-    
-    # 定义可能存在的容器名 (新旧版本)
+    # --- 容器清理 ---
     CONTAINERS=("proxyx" "proxy-vps")
-    
     for CON in "${CONTAINERS[@]}"; do
+        print_check "容器: $CON"
         if docker ps -a --format '{{.Names}}' | grep -q "^${CON}$"; then
-            echo -e "${YELLOW}   发现容器: ${CON}${NC}"
-            echo "   正在停止..."
+            print_found
+            
+            print_action "停止容器"
             docker stop "$CON" &> /dev/null
-            echo "   正在删除..."
+            print_success
+            
+            print_action "移除容器"
             docker rm "$CON" &> /dev/null
-            echo -e "${GREEN}   ✅ 容器 ${CON} 已移除。${NC}"
+            print_success
+        else
+            print_not_found
         fi
     done
 
-    # 检查并清理相关镜像
-    echo -e "${CYAN}🐳 正在检查 Docker 镜像...${NC}"
-    # 匹配包含 proxyx 或 proxy-server-vps 的镜像
-    IMAGES=$(docker images | grep "proxyx\|proxy-server-vps" | awk '{print $3}')
+    # --- 镜像清理 ---
+    print_check "相关 Docker 镜像"
+    # 获取 ID，排除掉 grep 自身的干扰
+    IMAGES=$(docker images --format "{{.ID}} {{.Repository}}" | grep "proxyx\|proxy-server-vps" | awk '{print $1}')
     
     if [ -n "$IMAGES" ]; then
-        echo -e "${YELLOW}   发现相关镜像 ID (可能会有多个):${NC}"
-        echo "$IMAGES"
-        docker rmi -f $IMAGES &> /dev/null
-        echo -e "${GREEN}   ✅ 相关 Docker 镜像已清理。${NC}"
+        print_found
+        # 转换为数组
+        IMG_LIST=($IMAGES)
+        for IMG in "${IMG_LIST[@]}"; do
+            print_action "删除镜像 ($IMG)"
+            docker rmi -f "$IMG" &> /dev/null
+            print_success
+        done
     else
-        echo "   未发现相关镜像，跳过。"
+        print_not_found
     fi
 else
-    echo "未检测到 Docker 环境，跳过 Docker 清理步骤。"
+    print_info "未检测到 Docker，跳过 Docker 清理。"
 fi
 
 echo ""
 
 # =========================================================
-# 2. 清理 Systemd 服务 (二进制/源码版)
+# 2. 清理 Systemd 服务
 # =========================================================
-echo -e "${CYAN}⚙️  正在检查 Systemd 服务...${NC}"
+echo -e "${BOLD}2. 正在扫描 Systemd 服务...${PLAIN}"
 
-# 定义可能存在的服务名 (涵盖所有历史版本: proxyx, proxy-bin, proxy-node, proxy-server)
 SERVICES=("proxyx" "proxy-bin" "proxy-node" "proxy-server")
 
 for SVC in "${SERVICES[@]}"; do
-    if systemctl list-unit-files | grep -q "^${SVC}.service"; then
-        echo -e "${YELLOW}   发现服务: ${SVC}.service${NC}"
+    print_check "服务: ${SVC}.service"
+    
+    # 检查服务文件是否存在
+    if [ -f "/etc/systemd/system/${SVC}.service" ] || systemctl list-unit-files | grep -q "^${SVC}.service"; then
+        print_found
         
-        echo "   正在停止服务..."
-        systemctl stop "$SVC"
-        
-        echo "   正在禁用开机自启..."
+        # 检查是否正在运行
+        if systemctl is-active --quiet "$SVC"; then
+            print_action "停止运行中服务"
+            systemctl stop "$SVC"
+            print_success
+        fi
+
+        print_action "取消开机自启"
         systemctl disable "$SVC" &> /dev/null
-        
-        echo "   正在删除服务文件..."
+        print_success
+
+        print_action "删除 .service 文件"
         rm -f "/etc/systemd/system/${SVC}.service"
-        
-        echo -e "${GREEN}   ✅ 服务 ${SVC} 已卸载。${NC}"
+        print_success
+    else
+        print_not_found
     fi
 done
 
-# 重载 Systemd 配置
-systemctl daemon-reload
+# 重载 Systemd 防止报错
+if [ -d "/run/systemd/system" ]; then
+    systemctl daemon-reload &> /dev/null
+fi
 
 echo ""
 
 # =========================================================
 # 3. 清理文件系统
 # =========================================================
-echo -e "${CYAN}📂 正在清理安装文件...${NC}"
+echo -e "${BOLD}3. 正在扫描安装文件与残留...${PLAIN}"
 
-# 定义可能存在的安装目录 (新旧路径)
-DIRS=("/opt/proxyx" "/opt/proxy-server")
+# 定义要检查的目录和文件
+TARGETS=(
+    "/opt/proxyx" 
+    "/opt/proxy-server"
+    "/usr/local/bin/proxyx"
+)
 
-for DIR in "${DIRS[@]}"; do
-    if [ -d "$DIR" ]; then
-        echo -e "${YELLOW}   发现目录: ${DIR}${NC}"
-        rm -rf "$DIR"
-        echo -e "${GREEN}   ✅ 目录已永久删除。${NC}"
+for TARGET in "${TARGETS[@]}"; do
+    print_check "路径: $TARGET"
+    
+    if [ -e "$TARGET" ]; then
+        print_found
+        print_action "永久删除"
+        rm -rf "$TARGET"
+        print_success
+    else
+        print_not_found
     fi
 done
 
-# =========================================================
-# 4. 结束
-# =========================================================
 echo ""
-echo -e "${GREEN}=============================================${NC}"
-echo -e "${GREEN}      🎉 卸载完成！ProxyX 已彻底清除。        ${NC}"
-echo -e "${GREEN}=============================================${NC}"
+
+# =========================================================
+# 4. 结束汇总
+# =========================================================
+echo -e "${GREEN}=============================================${PLAIN}"
+echo -e "${GREEN}      🎉 卸载流程结束！清理完毕。             ${PLAIN}"
+echo -e "${GREEN}=============================================${PLAIN}"
