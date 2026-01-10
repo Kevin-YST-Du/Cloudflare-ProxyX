@@ -505,8 +505,9 @@ app.listen(PORT, () => {
 
 
 // ==============================================================================
-// 5. Dashboard HTML 渲染
+// 4. Dashboard 渲染 (UI 界面 - 最终修复版: 递归模块仓库路径修正)
 // ==============================================================================
+
 function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     const percent = Math.min(Math.round((count / limit) * 100), 100);
     const isAdmin = adminIps.includes(ip);
@@ -975,7 +976,7 @@ select:focus {
   
       <div class="section-box">
           <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
-              <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+              <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
               镜像源配置 (Daemon.json)
           </h2>
           <div class="code-area rounded-lg p-4 overflow-x-auto text-sm">
@@ -1111,7 +1112,7 @@ select:focus {
           }
   
           // ======================================================================
-          // 核心逻辑: GitHub/通用加速 (智能识别命令与纯链接)
+          // 核心逻辑: GitHub/通用加速 (智能识别 Git Clone vs Wget)
           // ======================================================================
           window.convertGithubUrl = function() {
             let input = document.getElementById('github-url').value.trim();
@@ -1137,14 +1138,29 @@ select:focus {
             let finalCommand = "";
             let label = "";
 
+            // 判断是否为纯链接
             const isPureUrl = (input === match?.[0]) || (('https://' + input) === originalUrl);
+            
+            // 【新增】判断是否为 GitHub 仓库主页 (而非文件)
+            // 匹配: github.com/user/repo 或 github.com/user/repo.git
+            // 排除: /blob/ 等路径
+            const repoRegex = /^https?:\\/\\/(?:www\\.)?github\\.com\\/[^\\/]+\\/[^\\/]+(?:\\.git)?\\/?$/;
 
             if (isPureUrl) {
-                const fileName = originalUrl.split('/').pop() || 'download';
-                finalCommand = 'wget -c -O "' + fileName + '" "' + proxiedUrl + '"';
-                label = "终端命令 (Wget):";
-                window.showToast('✅ 已生成 Wget 命令');
+                if (repoRegex.test(originalUrl)) {
+                    // 场景 A: 是仓库主页 -> Git Clone
+                    finalCommand = 'git clone ' + proxiedUrl;
+                    label = "终端命令 (Git Clone):";
+                    window.showToast('✅ 已识别为仓库');
+                } else {
+                    // 场景 B: 是具体文件 -> Wget
+                    const fileName = originalUrl.split('/').pop() || 'download';
+                    finalCommand = 'wget -c -O "' + fileName + '" "' + proxiedUrl + '"';
+                    label = "终端命令 (Wget):";
+                    window.showToast('✅ 已生成 Wget 命令');
+                }
             } else {
+                // 场景 C: 是完整命令 -> 替换链接
                 finalCommand = input.replace(originalUrl, proxiedUrl);
                 label = "终端命令 (自动替换):";
                 window.showToast('✅ 已替换命令中的链接');
@@ -1166,7 +1182,7 @@ select:focus {
           window.copyGithubCmd = function() { window.copyToClipboard(githubCommand).then(() => window.showToast('✅ 命令已复制')); }
 
           // ======================================================================
-          // 核心逻辑: 递归脚本加速 (Wget/Bash 智能切换)
+          // 核心逻辑: 递归脚本加速 (Wget/Bash/Git Clone 智能三合一)
           // ======================================================================
           window.convertRecursiveUrl = function() {
             let input = document.getElementById('recursive-url').value.trim();
@@ -1181,32 +1197,51 @@ select:focus {
                 if (!targetUrl.startsWith('http')) { targetUrl = 'https://' + targetUrl; }
             }
             
-            // 2. 构造代理链接
-            const prefix = window.location.origin + '/' + window.WORKER_PASSWORD + '/r/';
-            const fullUrl = prefix + targetUrl;
-            recursiveUrlOnly = fullUrl;
+            // 2. 构造两种代理路径 (RawPath 用于 Git, RecursivePath 用于脚本)
+            const baseUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/';
+            const rawProxyUrl = baseUrl + targetUrl;      // 不带 /r/
+            const recursiveProxyUrl = baseUrl + 'r/' + targetUrl; // 带 /r/
 
-            // 3. 智能判断生成 Wget 还是 Bash
-            // 如果包含 'bash', 'curl', 'wget' 或者有空格，则认为是完整命令
+            // 3. 智能判断生成模式
             const isCommand = input.includes('bash') || input.includes('curl') || input.includes('wget') || input.includes(' ');
+            const repoRegex = /^https?:\\/\\/(?:www\\.)?github\\.com\\/[^\\/]+\\/[^\\/]+(?:\\.git)?\\/?$/;
+
             let label = "";
+            let displayUrl = recursiveProxyUrl; // 默认显示递归链接
 
             if (isCommand && urlMatch) {
-                 // 如果是命令，保留原格式，替换 URL
-                 recursiveCommand = input.replace(targetUrl, fullUrl);
+                 // 场景 A: 完整命令 (如 curl | bash)
+                 // 如果命令中包含 'git clone'，或者 URL 是一个 repo，通常应该用 Raw Path
+                 if (input.includes('git clone') || repoRegex.test(targetUrl)) {
+                     recursiveCommand = input.replace(targetUrl, rawProxyUrl);
+                     displayUrl = rawProxyUrl;
+                 } else {
+                     recursiveCommand = input.replace(targetUrl, recursiveProxyUrl);
+                 }
                  label = "终端命令 (自动替换):";
                  window.showToast('✅ 已替换命令中的链接');
             } else {
-                 // 如果是纯链接，默认生成 Wget
-                 const fileName = targetUrl.split('/').pop() || 'script';
-                 recursiveCommand = 'wget -c -O "' + fileName + '" "' + fullUrl + '"';
-                 label = "终端命令 (Wget):";
-                 window.showToast('✅ 已生成 Wget 命令');
+                 // 场景 B: 纯链接
+                 if (repoRegex.test(targetUrl)) {
+                     // B1: 是 GitHub 仓库 -> Git Clone -> 【关键修复】使用 Raw Path (不带 /r/)
+                     recursiveCommand = 'git clone ' + rawProxyUrl;
+                     displayUrl = rawProxyUrl; 
+                     label = "终端命令 (Git Clone):";
+                     window.showToast('✅ 已识别为仓库 (Raw模式)');
+                 } else {
+                     // B2: 是普通文件/脚本 -> Wget -> 使用 Recursive Path (带 /r/)
+                     const fileName = targetUrl.split('/').pop() || 'script';
+                     recursiveCommand = 'wget -c -O "' + fileName + '" "' + recursiveProxyUrl + '"';
+                     displayUrl = recursiveProxyUrl;
+                     label = "终端命令 (Wget):";
+                     window.showToast('✅ 已生成 Wget 命令');
+                 }
             }
             
-            // 4. 更新 UI
+            recursiveUrlOnly = displayUrl; // 更新复制按钮的目标
+            
             document.getElementById('recursive-result-url').textContent = recursiveUrlOnly;
-            document.getElementById('recursive-cmd-label').textContent = "2. " + label; // 动态更新标签
+            document.getElementById('recursive-cmd-label').textContent = "2. " + label; 
             document.getElementById('recursive-result-cmd').textContent = recursiveCommand;
             document.getElementById('recursive-result-box').classList.remove('hidden');
           }
