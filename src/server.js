@@ -1,12 +1,13 @@
 /**
  * -----------------------------------------------------------------------------------------
  * ProxyX Server (VPS Node.js Edition)
- * 版本: v4.6
- * 核心功能: 
- * 1. Docker & Linux 镜像加速
- * 2. 递归脚本加速 (Recursive Proxy)
- * 3. 自动修复浏览器合并斜杠问题 (https:/ip.sb -> https://ip.sb)
- * 4. 完整的访问控制 (黑白名单、IP限制、地区限制)
+ * 版本: v4.7 (Sync with Worker v4.5)
+ * -----------------------------------------------------------------------------------------
+ * 核心功能同步:
+ * 1. [新增] ALLOW_REFERER 免密访问 (支持域名/URL前缀匹配)。
+ * 2. [新增] 管理员 IP 免密访问 Dashboard 和代理路径。
+ * 3. [优化] 递归/Docker 核心逻辑与 Cloudflare Worker 版本保持一致。
+ * 4. [保留] 针对 VPS 环境的自动修正双斜杠 (https:/ -> https://) 容错逻辑。
  * -----------------------------------------------------------------------------------------
  */
 
@@ -23,7 +24,7 @@ if (fs.existsSync(envPath)) {
     console.log(`[Config] Loading config from: ${envPath}`);
     require('dotenv').config({ path: envPath });
 } else {
-    // 兼容 Docker 环境 (环境变量直接注入)
+    // 兼容 Docker 环境
     require('dotenv').config(); 
 }
 
@@ -39,7 +40,7 @@ const cacheTTL = parseInt(process.env.CACHE_TTL || "3600");
 const myCache = new NodeCache({ stdTTL: cacheTTL }); 
 const PORT = process.env.PORT || 21011; 
 
-// --- 内存级频率限制存储 (替代 Cloudflare KV/D1) ---
+// --- 内存级频率限制存储 (替代 Cloudflare KV) ---
 const rateLimitStore = new Map();
 
 // ==============================================================================
@@ -60,26 +61,29 @@ const CONFIG = {
     CACHE_TTL: cacheTTL,
     
     // --- 访问控制 (安全设置) ---
-    BLACKLIST: parseList(process.env.BLACKLIST, ""),           // 黑名单域名
-    WHITELIST: parseList(process.env.WHITELIST, ""),           // 白名单域名 (设置后仅允许这些)
-    ALLOW_IPS: parseList(process.env.ALLOW_IPS, ""),           // 允许访问的客户端 IP
-    ALLOW_COUNTRIES: parseList(process.env.ALLOW_COUNTRIES, ""), // 允许的国家代码 (需配合 IP 库，暂预留)
+    BLACKLIST: parseList(process.env.BLACKLIST, ""),
+    WHITELIST: parseList(process.env.WHITELIST, ""),
+    ALLOW_IPS: parseList(process.env.ALLOW_IPS, ""),
+    ALLOW_COUNTRIES: parseList(process.env.ALLOW_COUNTRIES, ""), // VPS版暂未集成GeoIP库，预留
     
+    // --- 免密访问增强 ---
+    // 格式: "github.com" (域名) 或 "https://github.com/User" (完整前缀)
+    ALLOW_REFERER: process.env.ALLOW_REFERER || "",
+
     // --- 额度限制 ---
     DAILY_LIMIT_COUNT: parseInt(process.env.DAILY_LIMIT_COUNT || "200"),
     
     // --- 权限管理 ---
-    ADMIN_IPS: parseList(process.env.ADMIN_IPS, "127.0.0.1"),  // 管理员 IP
-    IP_LIMIT_WHITELIST: parseList(process.env.IP_LIMIT_WHITELIST, "127.0.0.1"), // 免限额 IP
+    ADMIN_IPS: parseList(process.env.ADMIN_IPS, "127.0.0.1"),
+    IP_LIMIT_WHITELIST: parseList(process.env.IP_LIMIT_WHITELIST, "127.0.0.1"),
 };
 
 // 打印关键配置
 console.log("---------------------------------------");
-console.log(`ProxyX Server Starting...`);
-console.log(`PORT: ${PORT}`);
+console.log(`ProxyX Server Starting on Port ${PORT}`);
 console.log(`PASSWORD: ${CONFIG.PASSWORD}`);
-console.log(`CACHE: ${CONFIG.ENABLE_CACHE ? 'Enabled' : 'Disabled'} (TTL: ${CONFIG.CACHE_TTL}s)`);
 console.log(`ADMIN_IPS: ${JSON.stringify(CONFIG.ADMIN_IPS)}`);
+console.log(`ALLOW_REFERER: ${CONFIG.ALLOW_REFERER ? 'Configured' : 'None'}`);
 console.log("---------------------------------------");
 
 // Docker 上游配置
@@ -139,7 +143,7 @@ const checkRateLimit = (req, res, next) => {
         return res.status(429).send(`⚠️ Daily Limit Exceeded: ${count}/${CONFIG.DAILY_LIMIT_COUNT}`);
     }
     
-    // 简单计数 (实际扣费逻辑在请求成功后更佳，这里做简单预扣)
+    // 简单计数 (VPS版内存存储)
     rateLimitStore.set(key, count + 1);
     next();
 };
@@ -315,32 +319,82 @@ app.use('/v2', async (req, res) => {
     }
 });
 
-// --- 4.3 通用代理入口 (重点逻辑) ---
-// 支持 /:password 和 /:password/* 两种匹配
-app.all(['/:password', '/:password/*'], async (req, res) => {
-    const password = req.params.password;
-    // 获取通配符部分，如果为空字符串则代表只访问了 /密码
-    let subPath = req.params[0] || ""; 
+// --- 4.3 通用代理入口 (核心逻辑) ---
+// 为了支持免密访问 (如 /ubuntu 而不需要 /password/ubuntu)，我们捕获所有请求并手动解析
+app.all('*', async (req, res) => {
+    const clientIP = getClientIP(req);
+    const referer = req.headers['referer'] || "";
+    const path = req.path;
 
-    if (password !== CONFIG.PASSWORD) {
+    // --- 认证与信任判断 ---
+    // 1. 判断是否为管理员 IP
+    const isAdminIp = CONFIG.ADMIN_IPS.includes(clientIP);
+
+    // 2. 判断 Referer 是否在允许列表中
+    let isTrustedReferer = false;
+    if (CONFIG.ALLOW_REFERER && referer) {
+        const allowedRules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s => s.trim()).filter(s => s);
+        for (const rule of allowedRules) {
+            // A. 完整 URL 前缀匹配 (如 https://github.com/User)
+            if (rule.includes("://")) {
+                if (referer.startsWith(rule)) { isTrustedReferer = true; break; }
+            } 
+            // B. 域名匹配 (如 github.com)
+            else {
+                try {
+                    const refUrl = new URL(referer);
+                    if (refUrl.hostname === rule || refUrl.hostname.endsWith("." + rule)) {
+                        isTrustedReferer = true; break;
+                    }
+                } catch(e) {
+                    if (referer.includes(rule)) { isTrustedReferer = true; break; }
+                }
+            }
+        }
+    }
+
+    const isTrusted = isAdminIp || isTrustedReferer;
+
+    // --- 路径解析 ---
+    let subPath = "";
+    let isAuthenticated = false;
+
+    // 解析路径结构: /密码/目标URL
+    // 例如: /123456/https://google.com  => password=123456, target=https://google.com
+    const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
+
+    // 认证方式 A: URL 携带正确密码
+    if (match && match[1] === CONFIG.PASSWORD) {
+        isAuthenticated = true;
+        subPath = match[2] || ""; 
+    } 
+    // 认证方式 B: 信任来源 (免密)
+    else if (isTrusted) {
+        isAuthenticated = true;
+        // 免密模式下，整个 Path 去掉开头的 / 就是目标路径
+        // 例如访问 /ubuntu/xxx，subPath 就是 ubuntu/xxx
+        subPath = path.substring(1); 
+    }
+
+    // 未通过认证 -> 404
+    if (!isAuthenticated) {
         return res.status(404).send("404 Not Found - Powered by ProxyX");
     }
 
-    const clientIP = getClientIP(req);
-
     // --- 4.3.1 管理员 API ---
+    // 敏感操作仅允许管理员 IP，Referer 免密不授予此权限
     if (subPath === "reset") {
-        if (!CONFIG.ADMIN_IPS.includes(clientIP)) return res.status(403).send("Forbidden");
+        if (!isAdminIp) return res.status(403).send("Forbidden: Admin IP Required");
         rateLimitStore.delete(`${clientIP}:${getDate()}`);
         return res.json({ status: "success" });
     }
     if (subPath === "reset-all") {
-        if (!CONFIG.ADMIN_IPS.includes(clientIP)) return res.status(403).send("Forbidden");
+        if (!isAdminIp) return res.status(403).send("Forbidden: Admin IP Required");
         rateLimitStore.clear();
         return res.json({ status: "success" });
     }
     if (subPath === "stats") {
-        if (!CONFIG.ADMIN_IPS.includes(clientIP)) return res.status(403).send("Forbidden");
+        if (!isAdminIp) return res.status(403).send("Forbidden: Admin IP Required");
         const stats = [];
         const today = getDate();
         rateLimitStore.forEach((val, key) => {
@@ -350,14 +404,13 @@ app.all(['/:password', '/:password/*'], async (req, res) => {
         return res.json({ status: "success", data: { totalRequests: 0, uniqueIps: stats.length, details: stats } });
     }
 
-    // --- 4.3.2 仪表盘入口 ---
-    // 如果 subPath 为空，或者浏览器自动请求了 /密码/ (以/结尾但无内容)
+    // --- 4.3.2 仪表盘 ---
     if (!subPath) {
         const count = rateLimitStore.get(`${clientIP}:${getDate()}`) || 0;
         return res.send(renderDashboard(req.hostname, CONFIG.PASSWORD, clientIP, count, CONFIG.DAILY_LIMIT_COUNT, CONFIG.ADMIN_IPS));
     }
 
-    // --- 4.3.3 Linux 源加速逻辑 ---
+    // --- 4.3.3 Linux 源加速 ---
     const sortedMirrors = Object.keys(LINUX_MIRRORS).sort((a, b) => b.length - a.length);
     const linuxDistro = sortedMirrors.find(k => subPath.startsWith(k + '/') || subPath === k);
 
@@ -386,9 +439,9 @@ app.all(['/:password', '/:password/*'], async (req, res) => {
         }
     }
 
-    // --- 4.3.4 通用文件/递归加速逻辑 ---
+    // --- 4.3.4 通用文件/递归加速 ---
     
-    // [1] 处理递归模式
+    // [1] 递归模式判断
     let proxyMode = 'raw';
     let targetUrlStr = subPath;
 
@@ -397,15 +450,11 @@ app.all(['/:password', '/:password/*'], async (req, res) => {
         targetUrlStr = subPath.replace(/^r\/?/, "");
     }
 
-    // [2] 自动修正 URL (核心修复：解决浏览器合并双斜杠问题)
-    // 场景: 用户输入 https:/ip.sb (浏览器行为) -> 修正为 https://ip.sb
+    // [2] 自动修正 URL (浏览器合并双斜杠修复)
     if (!targetUrlStr.startsWith("http")) {
-        // 如果完全没有协议头 (如 ip.sb)，默认补全 https://
         targetUrlStr = 'https://' + targetUrlStr;
     } else {
-        // 如果有协议头但斜杠不对 (如 https:/ip.sb 或 http:/ip.sb)
-        // 正则解释: 匹配 http: 或 https: 后紧跟 1个或多个斜杠，且后面不跟斜杠的情况
-        // 替换为标准的 ://
+        // 将 https:/ip.sb 修复为 https://ip.sb
         targetUrlStr = targetUrlStr.replace(/^(https?):\/+(?!\/)/, '$1://');
     }
 
@@ -440,7 +489,7 @@ app.all(['/:password', '/:password/*'], async (req, res) => {
         const headers = { ...req.headers };
         delete headers['host'];
         delete headers['connection'];
-        // 伪装 UA 防止被拒绝
+        // 伪装 UA
         if (!headers['user-agent']) headers['user-agent'] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
         const upstreamRes = await fetch(targetUrlStr, {
@@ -452,29 +501,29 @@ app.all(['/:password', '/:password/*'], async (req, res) => {
 
         res.status(upstreamRes.status);
         upstreamRes.headers.forEach((v, k) => {
-            // 递归模式下，这些头会导致修改后的 body 长度不匹配，必须删除
             if (proxyMode === 'recursive' && (k === 'content-encoding' || k === 'content-length' || k === 'transfer-encoding')) return;
             res.setHeader(k, v);
         });
 
         res.setHeader('X-Proxy-Mode', proxyMode === 'recursive' ? 'Recursive-Force-Text' : 'Raw-Passthrough');
-        res.removeHeader('content-security-policy'); // 移除 CSP 以便在网页中展示
+        res.removeHeader('content-security-policy');
 
-        // A. Raw 模式：直接透传二进制流
+        // A. Raw 模式
         if (proxyMode === 'raw') {
             const arrayBuffer = await upstreamRes.arrayBuffer();
             res.send(Buffer.from(arrayBuffer));
             return;
         }
 
-        // B. 递归模式：文本替换
+        // B. 递归模式
         if (proxyMode === 'recursive') {
             let text = await upstreamRes.text();
             
             const workerOrigin = `${req.protocol}://${req.get('host')}`;
-            const proxyBase = `${workerOrigin}/${CONFIG.PASSWORD}/r/`;
+            // 如果是免密访问，递归前缀不需要密码；如果是密码访问，加上密码
+            const prefixPath = (isTrusted && !path.startsWith('/' + CONFIG.PASSWORD)) ? '' : `/${CONFIG.PASSWORD}`;
+            const proxyBase = `${workerOrigin}${prefixPath}/r/`;
 
-            // 正则替换 http/https 链接，加上代理前缀
             const regex = /(https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))/g;
             
             text = text.replace(regex, (match) => {
@@ -482,7 +531,6 @@ app.all(['/:password', '/:password/*'], async (req, res) => {
                 return proxyBase + match;
             });
 
-            // 写入缓存
             if (CONFIG.ENABLE_CACHE && upstreamRes.status === 200) {
                 myCache.set(cacheKey, text);
             }
@@ -495,9 +543,6 @@ app.all(['/:password', '/:password/*'], async (req, res) => {
     }
 });
 
-// 默认兜底
-app.use((req, res) => res.status(404).send('404 Not Found - Powered by ProxyX'));
-
 // 启动监听
 app.listen(PORT, () => {
     console.log(`ProxyX Server running on port ${PORT}`);
@@ -505,9 +550,8 @@ app.listen(PORT, () => {
 
 
 // ==============================================================================
-// 4. Dashboard 渲染 (UI 界面 - 最终修复版: 递归模块仓库路径修正)
+// 5. Dashboard HTML 渲染 (已更新到最新版 UI)
 // ==============================================================================
-
 function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     const percent = Math.min(Math.round((count / limit) * 100), 100);
     const isAdmin = adminIps.includes(ip);
@@ -973,10 +1017,10 @@ select:focus {
             <button onclick="copyLinuxCommand()" class="w-full bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition">复制命令</button>
         </div>
       </div>
-  
+ 
       <div class="section-box">
           <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
-              <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
+              <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
               镜像源配置 (Daemon.json)
           </h2>
           <div class="code-area rounded-lg p-4 overflow-x-auto text-sm">
@@ -992,12 +1036,12 @@ select:focus {
               复制配置
           </button>
       </div>
-  
+ 
       <footer class="mt-12 text-center pb-8">
             <a href="https://github.com/Kevin-YST-Du/Cloudflare-ProxyX" target="_blank" class="text-[10px] text-blue-600 dark:text-blue-400 uppercase tracking-widest font-bold opacity-80 hover:opacity-100 hover:underline transition-all">Powered by Kevin-YST-Du/Cloudflare-ProxyX</a>
       </footer>
     </div>
-  
+ 
     <div id="confirmModal" class="modal-overlay">
       <div class="modal-content">
          <div class="text-center">
@@ -1036,7 +1080,7 @@ select:focus {
     <script>
       try {
           // --- 初始化全局变量 ---
-          window.CURRENT_DOMAIN = window.location.hostname;
+          window.CURRENT_DOMAIN = window.location.hostname + (window.location.port ? ':' + window.location.port : '');
           window.WORKER_PASSWORD = "${password}"; 
           window.CURRENT_CLIENT_IP = "${ip}";
           window.LINUX_MIRRORS = ${linuxMirrorsJson};
@@ -1067,7 +1111,7 @@ select:focus {
           const daemonJsonStr = JSON.stringify(daemonJsonObj, null, 2);
           const daemonEl = document.getElementById('daemon-json-content');
           if (daemonEl) daemonEl.textContent = daemonJsonStr;
-  
+ 
           // --- 主题切换逻辑 ---
           window.toggleTheme = function() {
             try {
@@ -1088,7 +1132,7 @@ select:focus {
           
           // 页面加载时恢复主题设置
           try { if (localStorage.getItem('theme') === 'dark') window.toggleTheme(); } catch(e) {}
-  
+ 
           // --- 提示框 (Toast) 工具 ---
           window.showToast = function(message, isError = false) {
             const toast = document.getElementById('toast');
@@ -1096,21 +1140,30 @@ select:focus {
             toast.className = 'toast ' + (isError ? 'bg-red-500' : 'bg-slate-800') + ' show';
             setTimeout(() => toast.classList.remove('show'), 3000);
           }
-  
+ 
           // --- 模态框控制 ---
           window.openModal = function(id) { document.getElementById(id).classList.add('open'); }
           window.closeModal = function(id) { document.getElementById(id).classList.remove('open'); }
-  
+ 
           // --- 剪贴板复制工具 ---
           window.copyToClipboard = function(text) {
-            if (navigator.clipboard && window.isSecureContext) { return navigator.clipboard.writeText(text); }
+            if (navigator.clipboard && window.isSecureContext) { 
+                return navigator.clipboard.writeText(text); 
+            }
+            // 降级方案：HTTP 环境兼容
             const textArea = document.createElement("textarea");
-            textArea.value = text; textArea.style.position = "fixed";
+            textArea.value = text; textArea.style.position = "fixed"; textArea.style.left = "-9999px";
             document.body.appendChild(textArea); textArea.focus(); textArea.select();
-            try { document.execCommand('copy'); document.body.removeChild(textArea); return Promise.resolve(); } 
-            catch (err) { document.body.removeChild(textArea); return Promise.reject(err); }
+            try { 
+                document.execCommand('copy'); 
+                document.body.removeChild(textArea); 
+                return Promise.resolve(); 
+            } catch (err) { 
+                document.body.removeChild(textArea); 
+                return Promise.reject(err); 
+            }
           }
-  
+ 
           // ======================================================================
           // 核心逻辑: GitHub/通用加速 (智能识别 Git Clone vs Wget)
           // ======================================================================
@@ -1131,8 +1184,11 @@ select:focus {
                     return window.showToast('❌ 无法识别有效链接', true);
                 }
             }
+            
+            // 修复双斜杠问题
+            originalUrl = originalUrl.replace(/^(https?):\/+/, '$1://');
 
-            const prefix = window.location.origin + '/' + window.WORKER_PASSWORD + '/';
+            const prefix = window.location.protocol + '//' + window.CURRENT_DOMAIN + '/' + window.WORKER_PASSWORD + '/';
             const proxiedUrl = prefix + originalUrl;
 
             let finalCommand = "";
@@ -1141,9 +1197,7 @@ select:focus {
             // 判断是否为纯链接
             const isPureUrl = (input === match?.[0]) || (('https://' + input) === originalUrl);
             
-            // 【新增】判断是否为 GitHub 仓库主页 (而非文件)
-            // 匹配: github.com/user/repo 或 github.com/user/repo.git
-            // 排除: /blob/ 等路径
+            // 判断是否为 GitHub 仓库主页 (而非文件)
             const repoRegex = /^https?:\\/\\/(?:www\\.)?github\\.com\\/[^\\/]+\\/[^\\/]+(?:\\.git)?\\/?$/;
 
             if (isPureUrl) {
@@ -1196,10 +1250,12 @@ select:focus {
             } else {
                 if (!targetUrl.startsWith('http')) { targetUrl = 'https://' + targetUrl; }
             }
+            // 修复双斜杠
+            targetUrl = targetUrl.replace(/^(https?):\/+/, '$1://');
             
-            // 2. 构造两种代理路径 (RawPath 用于 Git, RecursivePath 用于脚本)
-            const baseUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/';
-            const rawProxyUrl = baseUrl + targetUrl;      // 不带 /r/
+            // 2. 构造两种代理路径
+            const baseUrl = window.location.protocol + '//' + window.CURRENT_DOMAIN + '/' + window.WORKER_PASSWORD + '/';
+            const rawProxyUrl = baseUrl + targetUrl;       // 不带 /r/
             const recursiveProxyUrl = baseUrl + 'r/' + targetUrl; // 带 /r/
 
             // 3. 智能判断生成模式
@@ -1210,8 +1266,7 @@ select:focus {
             let displayUrl = recursiveProxyUrl; // 默认显示递归链接
 
             if (isCommand && urlMatch) {
-                 // 场景 A: 完整命令 (如 curl | bash)
-                 // 如果命令中包含 'git clone'，或者 URL 是一个 repo，通常应该用 Raw Path
+                 // 场景 A: 完整命令
                  if (input.includes('git clone') || repoRegex.test(targetUrl)) {
                      recursiveCommand = input.replace(targetUrl, rawProxyUrl);
                      displayUrl = rawProxyUrl;
@@ -1223,13 +1278,13 @@ select:focus {
             } else {
                  // 场景 B: 纯链接
                  if (repoRegex.test(targetUrl)) {
-                     // B1: 是 GitHub 仓库 -> Git Clone -> 【关键修复】使用 Raw Path (不带 /r/)
+                     // B1: 是 GitHub 仓库 -> Git Clone -> 使用 Raw Path
                      recursiveCommand = 'git clone ' + rawProxyUrl;
                      displayUrl = rawProxyUrl; 
                      label = "终端命令 (Git Clone):";
                      window.showToast('✅ 已识别为仓库 (Raw模式)');
                  } else {
-                     // B2: 是普通文件/脚本 -> Wget -> 使用 Recursive Path (带 /r/)
+                     // B2: 是普通文件/脚本 -> Wget -> 使用 Recursive Path
                      const fileName = targetUrl.split('/').pop() || 'script';
                      recursiveCommand = 'wget -c -O "' + fileName + '" "' + recursiveProxyUrl + '"';
                      displayUrl = recursiveProxyUrl;
@@ -1238,7 +1293,7 @@ select:focus {
                  }
             }
             
-            recursiveUrlOnly = displayUrl; // 更新复制按钮的目标
+            recursiveUrlOnly = displayUrl; 
             
             document.getElementById('recursive-result-url').textContent = recursiveUrlOnly;
             document.getElementById('recursive-cmd-label').textContent = "2. " + label; 
@@ -1249,7 +1304,7 @@ select:focus {
           window.copyRecursiveUrlOnly = function() { window.copyToClipboard(recursiveUrlOnly).then(() => window.showToast('✅ 链接已复制')); }
           window.openRecursiveUrl = function() { window.open(recursiveUrlOnly, '_blank'); }
           window.copyRecursiveCmd = function() { window.copyToClipboard(recursiveCommand).then(() => window.showToast('✅ 命令已复制')); }
-  
+ 
           // --- 业务逻辑: Docker 镜像 ---
           window.convertDockerImage = function() {
             const input = document.getElementById('docker-image').value.trim();
@@ -1264,8 +1319,8 @@ select:focus {
           // --- 业务逻辑: Linux 换源 ---
           window.generateLinuxCommand = function() {
               const distro = document.getElementById('linux-distro').value;
-              const baseUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/' + distro + '/';
-              const securityUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/' + distro + '-security/';
+              const baseUrl = window.location.protocol + '//' + window.CURRENT_DOMAIN + '/' + window.WORKER_PASSWORD + '/' + distro + '/';
+              const securityUrl = window.location.protocol + '//' + window.CURRENT_DOMAIN + '/' + window.WORKER_PASSWORD + '/' + distro + '-security/';
               
               if (distro === 'ubuntu') {
                   linuxCommand = 'sudo sed -i "s|http://archive.ubuntu.com/ubuntu/|' + baseUrl + '|g" /etc/apt/sources.list && ' +
@@ -1281,21 +1336,6 @@ select:focus {
                   linuxCommand = 'sudo sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/*.repo && ' +
                                  'sudo sed -i "s|#baseurl=http://mirror.centos.org|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/*.repo && ' +
                                  'sudo sed -i "s|baseurl=http://mirror.centos.org|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/*.repo';
-              } else if (distro === 'rockylinux') {
-                  linuxCommand = 'sudo sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/rocky*.repo && ' +
-                                 'sudo sed -i "s|#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/rocky*.repo && ' +
-                                 'sudo sed -i "s|baseurl=http://dl.rockylinux.org/$contentdir|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/rocky*.repo';
-              } else if (distro === 'almalinux') {
-                  linuxCommand = 'sudo sed -i "s/mirrorlist/#mirrorlist/g" /etc/yum.repos.d/almalinux*.repo && ' +
-                                 'sudo sed -i "s|#baseurl=https://repo.almalinux.org/almalinux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/almalinux*.repo && ' +
-                                 'sudo sed -i "s|baseurl=https://repo.almalinux.org/almalinux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/almalinux*.repo';
-              } else if (distro === 'fedora') {
-                  linuxCommand = 'sudo sed -i "s/metalink/#metalink/g" /etc/yum.repos.d/fedora*.repo && ' +
-                                 'sudo sed -i "s|#baseurl=http://download.example/pub/fedora/linux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/fedora*.repo && ' +
-                                 'sudo sed -i "s|baseurl=http://download.example/pub/fedora/linux|baseurl=' + baseUrl + '|g" /etc/yum.repos.d/fedora*.repo';
-              } else if (distro === 'alpine') {
-                  linuxCommand = 'sudo sed -i "s|http://dl-cdn.alpinelinux.org/alpine|' + baseUrl + '|g" /etc/apk/repositories && ' +
-                                 'sudo sed -i "s|https://dl-cdn.alpinelinux.org/alpine|' + baseUrl + '|g" /etc/apk/repositories';
               } else if (distro === 'termux') {
                   linuxCommand = 'sed -i "s|https://[^ ]*termux[^ ]*|' + baseUrl + '|g" $PREFIX/etc/apt/sources.list';
               } else {
@@ -1309,7 +1349,7 @@ select:focus {
           window.copyLinuxCommand = function() { window.copyToClipboard(linuxCommand).then(() => window.showToast('✅ 已复制')); }
 
           window.copyDaemonJson = function() { window.copyToClipboard(daemonJsonStr).then(() => window.showToast('✅ JSON 配置已复制')); }
-  
+ 
           // --- 业务逻辑: 重置额度 ---
           window.confirmReset = async function() {
             window.closeModal('confirmModal');
