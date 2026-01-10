@@ -1,6 +1,6 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker & Linux 代理 (v4.3 - 递归缓存增强版)
+ * Cloudflare Worker: 终极 Docker & Linux 代理 (v4.5 - Referer 增强版)
  * -----------------------------------------------------------------------------------------
  * 核心功能：
  * 1. Docker Hub/GHCR 等镜像仓库加速下载。
@@ -9,6 +9,8 @@
  * 4. 双模式通用代理 (Raw / Recursive)。
  * 5. [增强] 递归模式集成 Cache API，极大提升脚本二次访问速度。
  * 6. Dashboard: 递归加速模块样式与 GitHub 文件加速模块完全一致。
+ * 7. [新增] 管理员 IP 免密访问 Dashboard 和代理服务。
+ * 8. [升级] ALLOW_REFERER 支持多条规则，兼容纯域名和完整 URL 路径匹配。
  * -----------------------------------------------------------------------------------------
  */
 
@@ -29,11 +31,23 @@ const DEFAULT_CONFIG = {
     ALLOW_IPS: "",                    // 允许访问本 Worker 的客户端 IP (空则允许所有)
     ALLOW_COUNTRIES: "",              // 允许访问的国家代码 (如 CN, US)
     
+    // --- 免密访问增强 ---
+    // [修改] 指定允许免密访问的来源 Referer。支持逗号分隔多个。
+    // 格式支持两种：
+    // 1. 仅域名 (如 "github.com") -> 只要来源是该域名(或子域名)即通过。
+    // 2. 完整 URL 前缀 (如 "https://github.com/Kevin-YST-Du") -> 必须以该路径开头才通过。
+    ALLOW_REFERER: `
+    github.com
+    nodeseek.com
+    `,              
+    
     // --- 额度限制 (依赖 KV 存储) ---
     DAILY_LIMIT_COUNT: 200,           // 每个 IP 每日最大请求次数 (防滥用)
     
     // --- 权限管理 ---
-    // 管理员 IP 列表 (拥有重置额度、查看统计、清空全站数据的权限)
+    // 管理员 IP 列表 (拥有以下权限：
+    // 1. 免密码直接访问 Dashboard 和代理路径
+    // 2. 重置额度、查看统计、清空全站数据)
     ADMIN_IPS: `
     127.0.0.1
     `,                    
@@ -95,6 +109,8 @@ export default {
         const CONFIG = {
             PASSWORD: env.PASSWORD || DEFAULT_CONFIG.PASSWORD,
             ADMIN_IPS: parseList(env.ADMIN_IPS, DEFAULT_CONFIG.ADMIN_IPS),
+            // [修改] 读取 ALLOW_REFERER
+            ALLOW_REFERER: env.ALLOW_REFERER || DEFAULT_CONFIG.ALLOW_REFERER,
             MAX_REDIRECTS: parseInt(env.MAX_REDIRECTS || DEFAULT_CONFIG.MAX_REDIRECTS),
             ENABLE_CACHE: (env.ENABLE_CACHE || "true") === "true",
             CACHE_TTL: parseInt(env.CACHE_TTL || DEFAULT_CONFIG.CACHE_TTL),
@@ -109,13 +125,14 @@ export default {
         const url = new URL(request.url);
         const clientIP = request.headers.get("CF-Connecting-IP") || "0.0.0.0"; // 获取客户端真实IP
         const userAgent = (request.headers.get("User-Agent") || "").toLowerCase();
+        const referer = request.headers.get("Referer") || "";
         
         // --- 2.0 处理静态资源请求 ---
         if (url.pathname === '/robots.txt') return new Response("User-agent: *\nDisallow: /", { headers: { "Content-Type": "text/plain" } });
         if (url.pathname === '/favicon.ico') return new Response(LIGHTNING_SVG, { headers: { "Content-Type": "image/svg+xml" } });
 
         // --- 2.1 处理 Docker 认证 Token 请求 ---
-        // Docker 客户端在 pull 镜像前会先请求 /token 获取权限
+        // Docker 客户端在 pull 镜像前会先请求 /token 获取权限 (Docker 流程通常不需要密码前缀)
         if (url.pathname === '/token') {
             return handleTokenRequest(request, url);
         }
@@ -179,43 +196,98 @@ export default {
         let response;
         try {
             if (isDockerV2) {
-                // [分支 1] Docker 镜像加速逻辑
+                // [分支 1] Docker 镜像加速逻辑 (Docker 客户端通过 Token 认证，无需路径密码)
                 response = await handleDockerRequest(request, url);
             } else {
                 // [分支 2] 通用代理 / Dashboard / Linux 源
                 const path = url.pathname;
+                
+                // --- 2.5.0 免密/认证逻辑处理 ---
+                // 判断当前请求是否符合“免密”条件：
+                // 1. 客户端 IP 在管理员列表中 (Admin IP)
+                // 2. 请求来源 (Referer) 符合 ALLOW_REFERER 配置
+                const isAdminIp = CONFIG.ADMIN_IPS.includes(clientIP);
+                
+                // [升级] 智能 Referer 检查逻辑
+                let isTrustedReferer = false;
+                if (CONFIG.ALLOW_REFERER && referer) {
+                    const allowedRules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s => s.trim()).filter(s => s);
+                    
+                    for (const rule of allowedRules) {
+                        // 情况 A: 规则包含 "://" (说明是完整 URL 或前缀，如 "https://github.com/Kevin")
+                        if (rule.includes("://")) {
+                            if (referer.startsWith(rule)) {
+                                isTrustedReferer = true;
+                                break;
+                            }
+                        } 
+                        // 情况 B: 规则仅为主机名 (说明是域名，如 "github.com")
+                        else {
+                            try {
+                                const refererUrl = new URL(referer);
+                                // 检查主机名是否完全匹配，或者以 ".域名" 结尾 (允许子域名)
+                                if (refererUrl.hostname === rule || refererUrl.hostname.endsWith("." + rule)) {
+                                    isTrustedReferer = true;
+                                    break;
+                                }
+                            } catch (e) {
+                                // 如果 Referer 不是有效的 URL，降级为字符串包含检查 (容错)
+                                if (referer.includes(rule)) {
+                                    isTrustedReferer = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                const isTrusted = isAdminIp || isTrustedReferer;
+
+                let subPath = "";
+                let isAuthenticated = false;
+
                 // 解析路径结构: /密码/目标URL
                 const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
-                
-                // 密码验证：如果路径格式不对或密码错误，返回 404 (隐藏入口)
-                if (!match || match[1] !== CONFIG.PASSWORD) {
+
+                // 认证逻辑 A: URL 中携带了正确的密码
+                if (match && match[1] === CONFIG.PASSWORD) {
+                    isAuthenticated = true;
+                    subPath = match[2] || ""; // 提取密码后的部分
+                } 
+                // 认证逻辑 B: 满足信任条件 (免密)
+                else if (isTrusted) {
+                    isAuthenticated = true;
+                    // 在免密模式下，整个路径（去掉开头的/）即为 subPath
+                    // 例如访问 /ubuntu 实际就是请求 ubuntu 模块
+                    subPath = path.substring(1); 
+                }
+
+                // 如果未通过认证，返回 404 (隐藏入口)
+                if (!isAuthenticated) {
                     return new Response("404 Not Found", { status: 404 });
                 }
 
-                const subPath = match[2];
-
                 // --- 2.5.1 管理员 API 命令 ---
-                // 重置当前 IP 额度
+                // 注意：重置等敏感操作，建议只允许 IP 验证，防止 Referer 伪造带来的风险
+                // 这里我们加一个判断：只有真正的 ADMIN_IPS 才能执行写操作，Referer 免密只能访问代理
                 if (subPath === "reset") {
-                    if (!CONFIG.ADMIN_IPS.includes(clientIP)) return new Response("Forbidden", { status: 403 });
+                    if (!isAdminIp) return new Response("Forbidden: Admin IP Required", { status: 403 });
                     ctx.waitUntil(resetIpUsage(clientIP, env));
                     return new Response(JSON.stringify({ status: "success" }), { status: 200 });
                 }
-                // 清空全站数据 (危险操作)
                 if (subPath === "reset-all") {
-                    if (!CONFIG.ADMIN_IPS.includes(clientIP)) return new Response("Forbidden", { status: 403 });
+                    if (!isAdminIp) return new Response("Forbidden: Admin IP Required", { status: 403 });
                     ctx.waitUntil(resetAllIpStats(env));
                     return new Response(JSON.stringify({ status: "success" }), { status: 200 });
                 }
-                // 获取全站统计数据
                 if (subPath === "stats") {
-                    if (!CONFIG.ADMIN_IPS.includes(clientIP)) return new Response("Forbidden", { status: 403 });
+                    if (!isAdminIp) return new Response("Forbidden: Admin IP Required", { status: 403 });
                     const stats = await getAllIpStats(env);
                     return new Response(JSON.stringify({ status: "success", data: stats }), { status: 200 });
                 }
 
                 // --- 2.5.2 渲染 Dashboard ---
-                // 如果没有提供子路径 (例如只访问 /密码)，则显示 Web 界面
+                // 如果没有提供子路径 (例如只访问 /密码 或 免密访问 /)，则显示 Web 界面
                 if (!subPath) {
                     return new Response(renderDashboard(url.hostname, CONFIG.PASSWORD, clientIP, currentUsage, CONFIG.DAILY_LIMIT_COUNT, CONFIG.ADMIN_IPS), {
                         status: 200, headers: { "Content-Type": "text/html;charset=UTF-8" }
