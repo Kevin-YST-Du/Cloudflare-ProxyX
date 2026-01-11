@@ -1,127 +1,70 @@
 /**
  * -----------------------------------------------------------------------------------------
- * ProxyX Server (VPS Node.js Edition)
- * 版本: v4.8 (GeoIP Integrated)
+ * Cloudflare Worker: 终极 Docker & Linux 代理 (v4.5 - Referer 增强版)
  * -----------------------------------------------------------------------------------------
- * 核心功能:
+ * 核心功能：
  * 1. Docker Hub/GHCR 等镜像仓库加速下载。
  * 2. 智能处理 Docker 的 library/ 命名空间补全。
  * 3. Linux 软件源加速，支持 debian-security 及 Range 断点续传。
  * 4. 双模式通用代理 (Raw / Recursive)。
- * 5. 递归模式集成 Cache API，极大提升脚本二次访问速度。
+ * 5. [增强] 递归模式集成 Cache API，极大提升脚本二次访问速度。
  * 6. Dashboard: 递归加速模块样式与 GitHub 文件加速模块完全一致。
- * 7. [新增] 集成 geoip-lite，支持 ALLOW_COUNTRIES 国家级访问控制。
- * 8. [新增] ALLOW_REFERER 免密访问 (支持域名/URL前缀匹配)。
- * 9. [新增] 管理员 IP (ADMIN_IPS) 免密访问 Dashboard 和代理路径。
- * 10. [优化] 自动修复浏览器合并斜杠问题 (https:/ip.sb -> https://ip.sb)。
+ * 7. [新增] 管理员 IP 免密访问 Dashboard 和代理服务。
+ * 8. [升级] ALLOW_REFERER 支持多条规则，兼容纯域名和完整 URL 路径匹配。
  * -----------------------------------------------------------------------------------------
  */
 
-const path = require('path');
-const fs = require('fs');
-
-// --- 1. 智能加载配置 (.env) ---
-// 逻辑: 优先查找可执行文件同级目录下的 .env，如果没有则查找当前源码目录
-const envPath = process.pkg 
-    ? path.join(path.dirname(process.execPath), '.env') 
-    : path.join(__dirname, '.env');
-
-if (fs.existsSync(envPath)) {
-    console.log(`[Config] Loading config from: ${envPath}`);
-    require('dotenv').config({ path: envPath });
-} else {
-    // 兼容 Docker 环境 (环境变量直接注入)
-    require('dotenv').config(); 
-}
-
-const express = require('express');
-const NodeCache = require('node-cache');
-const http = require('http');
-const https = require('https');
-// [新增] 引入 GeoIP 库，用于查询 IP 归属地
-const geoip = require('geoip-lite');
-
-// --- 初始化 ---
-const app = express();
-const cacheTTL = parseInt(process.env.CACHE_TTL || "3600");
-const myCache = new NodeCache({ stdTTL: cacheTTL }); 
-const PORT = process.env.PORT || 21011; 
-
-// [新增] 引入 SQLite
-const Database = require('better-sqlite3');
-
-// --- 数据库初始化 ---
-const dataDir = path.join(process.cwd(), 'data');
-if (!fs.existsSync(dataDir)) { fs.mkdirSync(dataDir, { recursive: true }); }
-const db = new Database(path.join(dataDir, 'proxyx.db'));
-
-// 创建表 (ip和date联合主键，确保每日每IP唯一)
-db.exec(`CREATE TABLE IF NOT EXISTS rate_limits (
-    ip TEXT NOT NULL,
-    date TEXT NOT NULL,
-    count INTEGER DEFAULT 0,
-    PRIMARY KEY (ip, date)
-)`);
-
-// 预编译 SQL 语句 (提升性能)
-const stmts = {
-    get: db.prepare('SELECT count FROM rate_limits WHERE ip = ? AND date = ?'),
-    upsert: db.prepare(`INSERT INTO rate_limits (ip, date, count) VALUES (@ip, @date, 1) ON CONFLICT(ip, date) DO UPDATE SET count = count + 1`),
-    resetIp: db.prepare('DELETE FROM rate_limits WHERE ip = ? AND date = ?'),
-    resetAll: db.prepare('DELETE FROM rate_limits'),
-    stats: db.prepare('SELECT ip, count FROM rate_limits WHERE date = ? ORDER BY count DESC')
-};
-
 // ==============================================================================
-// 2. 全局配置定义
+// 1. 全局配置与常量定义
 // ==============================================================================
 
-// 辅助函数: 将逗号或换行符分隔的字符串解析为数组，并去空
-const parseList = (val, defaultVal) => {
-    const source = val || defaultVal || "";
-    return source.split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
-};
-
-const CONFIG = {
+const DEFAULT_CONFIG = {
     // --- 基础配置 ---
-    PASSWORD: process.env.PASSWORD || "123456",
-    MAX_REDIRECTS: parseInt(process.env.MAX_REDIRECTS || "5"),
-    ENABLE_CACHE: (process.env.ENABLE_CACHE || "true") === "true",
-    CACHE_TTL: cacheTTL,
+    PASSWORD: "123456",               // 访问密码 (用于 Web 界面登录和通用代理的路径验证)
+    MAX_REDIRECTS: 5,                 // 代理请求时允许的最大重定向次数 (防止死循环)
+    ENABLE_CACHE: true,               // 是否开启 Worker 级缓存 (减少回源请求，重点优化递归模式)
+    CACHE_TTL: 3600,                  // 缓存存活时间 (单位: 秒，默认1小时)
     
     // --- 访问控制 (安全设置) ---
-    BLACKLIST: parseList(process.env.BLACKLIST, ""),           // 黑名单域名
-    WHITELIST: parseList(process.env.WHITELIST, ""),           // 白名单域名 (设置后仅允许这些)
-    ALLOW_IPS: parseList(process.env.ALLOW_IPS, ""),           // 允许访问的客户端 IP (白名单)
-    
-    // [新增] 允许的国家代码 (如 CN, US, JP, HK)
-    // 如果设置了此项，只有来自这些国家的 IP 才能访问
-    ALLOW_COUNTRIES: parseList(process.env.ALLOW_COUNTRIES, ""), 
+    BLACKLIST: "",                    // 域名黑名单 (逗号分隔，禁止代理这些域名的内容)
+    WHITELIST: "",                    // 域名白名单 (逗号分隔，如果不为空，则只允许代理这些域名)
+    ALLOW_IPS: "",                    // 允许访问本 Worker 的客户端 IP (空则允许所有)
+    ALLOW_COUNTRIES: "",              // 允许访问的国家代码 (如 CN, US)
     
     // --- 免密访问增强 ---
-    // 格式: "github.com" (域名) 或 "https://github.com/User" (完整前缀)
-    // 允许特定的来源网站免密码调用本代理
-    ALLOW_REFERER: process.env.ALLOW_REFERER || "",
-
-    // --- 额度限制 ---
-    DAILY_LIMIT_COUNT: parseInt(process.env.DAILY_LIMIT_COUNT || "200"),
+    // [修改] 指定允许免密访问的来源 Referer。支持逗号分隔多个。
+    // 格式支持两种：
+    // 1. 仅域名 (如 "github.com") -> 只要来源是该域名(或子域名)即通过。
+    // 2. 完整 URL 前缀 (如 "https://github.com/Kevin-YST-Du") -> 必须以该路径开头才通过。
+    ALLOW_REFERER: `
+    github.com
+    nodeseek.com
+    `,              
+    
+    // --- 额度限制 (依赖 KV 存储) ---
+    DAILY_LIMIT_COUNT: 200,           // 每个 IP 每日最大请求次数 (防滥用)
     
     // --- 权限管理 ---
-    // 管理员 IP: 拥有重置额度权限，且访问代理时免密码
-    ADMIN_IPS: parseList(process.env.ADMIN_IPS, "127.0.0.1"),
-    // 免限额 IP: 这些 IP 访问不计入每日限额
-    IP_LIMIT_WHITELIST: parseList(process.env.IP_LIMIT_WHITELIST, "127.0.0.1"),
+    // 管理员 IP 列表 (拥有以下权限：
+    // 1. 免密码直接访问 Dashboard 和代理路径
+    // 2. 重置额度、查看统计、清空全站数据)
+    ADMIN_IPS: `
+    127.0.0.1
+    `,                    
+    
+    // 免额度 IP 白名单 (这些 IP 的请求不计入每日限额，例如你自己的服务器 IP)
+    IP_LIMIT_WHITELIST: `
+    127.0.0.1
+    `, 
 };
 
-// 打印关键配置信息到控制台
-console.log("---------------------------------------");
-console.log(`ProxyX Server Starting on Port ${PORT}`);
-console.log(`PASSWORD: ${CONFIG.PASSWORD}`);
-console.log(`ADMIN_IPS: ${JSON.stringify(CONFIG.ADMIN_IPS)}`);
-console.log(`GeoIP Check: ${CONFIG.ALLOW_COUNTRIES.length > 0 ? 'Enabled (' + CONFIG.ALLOW_COUNTRIES.join(',') + ')' : 'Disabled'}`);
-console.log("---------------------------------------");
+// 支持的 Docker Registry 上游列表 (用于判断请求是否指向已知的 Registry)
+const DOCKER_REGISTRIES = [
+    'docker.io', 'registry-1.docker.io', 'quay.io', 'gcr.io', 
+    'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io'
+];
 
-// Docker 上游配置
+// Docker 简写映射：将用户输入的 registry 别名映射到完整的 HTTPS URL
 const REGISTRY_MAP = {
     'ghcr.io': 'https://ghcr.io',
     'quay.io': 'https://quay.io',
@@ -132,129 +75,277 @@ const REGISTRY_MAP = {
     'nvcr.io': 'https://nvcr.io'
 };
 
-// Linux 软件源镜像配置
+// Linux 软件源镜像映射 (Key: URL路径前缀, Value: 上游官方源地址)
 const LINUX_MIRRORS = {
     'ubuntu': 'http://archive.ubuntu.com/ubuntu',
-    'ubuntu-security': 'http://security.ubuntu.com/ubuntu',
+    'ubuntu-security': 'http://security.ubuntu.com/ubuntu', // Ubuntu 安全源单独处理
     'debian': 'http://deb.debian.org/debian',
-    'debian-security': 'http://security.debian.org/debian-security',
+    'debian-security': 'http://security.debian.org/debian-security', // Debian 安全源单独处理
     'centos': 'https://vault.centos.org',
     'centos-stream': 'http://mirror.stream.centos.org',
-    'rockylinux': 'https://download.rockylinux.org/pub/rocky',
-    'almalinux': 'https://repo.almalinux.org/almalinux',
-    'fedora': 'https://download.fedoraproject.org/pub/fedora/linux',
+    'rockylinux': 'https://download.rockylinux.org/pub/rocky', // Rocky Linux (CentOS 替代品)
+    'almalinux': 'https://repo.almalinux.org/almalinux', // AlmaLinux (CentOS 替代品)
+    'fedora': 'https://download.fedoraproject.org/pub/fedora/linux', 
     'alpine': 'http://dl-cdn.alpinelinux.org/alpine',
     'kali': 'http://http.kali.org/kali',
     'archlinux': 'https://geo.mirror.pkgbuild.com',
-    'termux': 'https://packages.termux.org/apt/termux-main'
+    'termux': 'https://packages.termux.org/apt/termux-main'      
 };
 
+// 网站图标 (一个简单的闪电 SVG)
 const LIGHTNING_SVG = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" stroke="#F59E0B" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
 // ==============================================================================
-// 3. 中间件与工具函数
+// 2. Worker 主入口 (Main Handler)
 // ==============================================================================
 
-// 获取客户端真实 IP
-const getClientIP = (req) => {
-    // 优先从 CF-Connecting-IP 获取 (如果套了 Cloudflare CDN)
-    // 否则用 X-Forwarded-For (反代)，最后用直连 IP
-    const ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket.remoteAddress || '0.0.0.0';
-    // 处理 IPv6 映射格式 (::ffff:1.2.3.4 -> 1.2.3.4)
-    return ip.replace(/^.*:/, ''); 
-};
+export default {
+    async fetch(request, env, ctx) {
+        // 工具函数：将环境变量中的逗号/换行符分割的字符串转为数组
+        const parseList = (v, d) => (v || d).split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
+        
+        // --- 初始化配置 ---
+        // 优先读取 Cloudflare 环境变量 (env)，如果不存在则使用代码顶部的默认值
+        const CONFIG = {
+            PASSWORD: env.PASSWORD || DEFAULT_CONFIG.PASSWORD,
+            ADMIN_IPS: parseList(env.ADMIN_IPS, DEFAULT_CONFIG.ADMIN_IPS),
+            // [修改] 读取 ALLOW_REFERER
+            ALLOW_REFERER: env.ALLOW_REFERER || DEFAULT_CONFIG.ALLOW_REFERER,
+            MAX_REDIRECTS: parseInt(env.MAX_REDIRECTS || DEFAULT_CONFIG.MAX_REDIRECTS),
+            ENABLE_CACHE: (env.ENABLE_CACHE || "true") === "true",
+            CACHE_TTL: parseInt(env.CACHE_TTL || DEFAULT_CONFIG.CACHE_TTL),
+            BLACKLIST: parseList(env.BLACKLIST, DEFAULT_CONFIG.BLACKLIST),
+            WHITELIST: parseList(env.WHITELIST, DEFAULT_CONFIG.WHITELIST),
+            ALLOW_IPS: parseList(env.ALLOW_IPS, DEFAULT_CONFIG.ALLOW_IPS),
+            ALLOW_COUNTRIES: parseList(env.ALLOW_COUNTRIES, DEFAULT_CONFIG.ALLOW_COUNTRIES),
+            DAILY_LIMIT_COUNT: parseInt(env.DAILY_LIMIT_COUNT || DEFAULT_CONFIG.DAILY_LIMIT_COUNT),
+            IP_LIMIT_WHITELIST: parseList(env.IP_LIMIT_WHITELIST, DEFAULT_CONFIG.IP_LIMIT_WHITELIST),
+        };
 
-// 获取今日日期字符串 (用于限额 key)
-const getDate = () => new Date(new Date().getTime() + 28800000).toISOString().split('T')[0];
+        const url = new URL(request.url);
+        const clientIP = request.headers.get("CF-Connecting-IP") || "0.0.0.0"; // 获取客户端真实IP
+        const userAgent = (request.headers.get("User-Agent") || "").toLowerCase();
+        const referer = request.headers.get("Referer") || "";
+        
+        // --- 2.0 处理静态资源请求 ---
+        if (url.pathname === '/robots.txt') return new Response("User-agent: *\nDisallow: /", { headers: { "Content-Type": "text/plain" } });
+        if (url.pathname === '/favicon.ico') return new Response(LIGHTNING_SVG, { headers: { "Content-Type": "image/svg+xml" } });
 
-// [关键修复] 计费函数 (SQLite)
-const chargeRequest = (ip) => {
-    if (CONFIG.IP_LIMIT_WHITELIST.includes(ip)) return;
-    try {
-        // 使用预编译的 Upsert 语句，原子性写入数据库
-        stmts.upsert.run({ ip, date: getDate() });
-    } catch (e) { console.error("DB Write Error:", e); }
-};
-
-// [关键修复] 速率限制检查中间件 (SQLite)
-const checkRateLimit = (req, res, next) => {
-    const ip = getClientIP(req);
-    // ... (白名单跳过逻辑保持不变) ...
-
-    const today = getDate();
-    let count = 0;
-    try {
-        // 从数据库查询
-        const row = stmts.get.get(ip, today);
-        if (row) count = row.count;
-    } catch (e) { console.error("DB Read Error:", e); }
-
-    if (count >= CONFIG.DAILY_LIMIT_COUNT) {
-        return res.status(429).send(`⚠️ Daily Limit Exceeded: ${count}/${CONFIG.DAILY_LIMIT_COUNT}`);
-    }
-    next();
-};
-
-// 中间件: 设置 CORS 头
-app.use((req, res, next) => {
-    res.header("Access-Control-Allow-Origin", "*");
-    res.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, HEAD");
-    res.header("Access-Control-Allow-Headers", "*");
-    res.header("Docker-Distribution-API-Version", "registry/2.0");
-    if (req.method === 'OPTIONS') return res.sendStatus(200);
-    next();
-});
-
-// [核心功能] 中间件: 访问控制 (IP 白名单 + GeoIP 国家限制)
-app.use((req, res, next) => {
-    const ip = getClientIP(req);
-
-    // 1. IP 白名单检查 (优先级最高)
-    // 如果设置了 ALLOW_IPS，不在列表中的 IP 直接拒绝
-    if (CONFIG.ALLOW_IPS.length > 0) {
-        if (!CONFIG.ALLOW_IPS.includes(ip)) {
-            return res.status(403).send(`Access Denied (IP ${ip} Not Allowed)`);
-        }
-    }
-
-    // 2. GeoIP 国家检查
-    // 如果设置了 ALLOW_COUNTRIES，查询 IP 归属地并检查
-    if (CONFIG.ALLOW_COUNTRIES.length > 0) {
-        // 跳过内网 IP / 本地回环
-        if (ip === '127.0.0.1' || ip === 'localhost' || ip.startsWith('192.168.') || ip.startsWith('10.')) {
-            return next(); 
+        // --- 2.1 处理 Docker 认证 Token 请求 ---
+        // Docker 客户端在 pull 镜像前会先请求 /token 获取权限 (Docker 流程通常不需要密码前缀)
+        if (url.pathname === '/token') {
+            return handleTokenRequest(request, url);
         }
 
-        const geo = geoip.lookup(ip);
-        const country = geo ? geo.country : "XX"; // 获取不到归属地则标记为 XX
+        // --- 2.2 处理 CORS 预检请求 (OPTIONS) ---
+        // 允许浏览器跨域访问 API
+        if (request.method === "OPTIONS") {
+            return new Response(null, {
+                headers: {
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
+                    "Access-Control-Allow-Headers": "*",
+                    "Access-Control-Max-Age": "86400",
+                    "Docker-Distribution-API-Version": "registry/2.0"
+                },
+            });
+        }
 
-        if (!CONFIG.ALLOW_COUNTRIES.includes(country)) {
-            console.log(`[Block] IP: ${ip} | Country: ${country} | Not in allowed list: ${CONFIG.ALLOW_COUNTRIES}`);
-            return res.status(403).send(`Access Denied (Country ${country} Not Allowed)`);
+        // --- 2.3 安全与地区检查 ---
+        // 如果配置了允许的 IP 或国家，则拒绝其他请求
+        if (CONFIG.ALLOW_IPS.length > 0 || CONFIG.ALLOW_COUNTRIES.length > 0) {
+            const country = request.cf ? request.cf.country : "XX";
+            let allow = false;
+            if (CONFIG.ALLOW_IPS.includes(clientIP)) allow = true;
+            if (!allow && CONFIG.ALLOW_COUNTRIES.includes(country)) allow = true;
+            if (!allow) return new Response(`Access Denied`, { status: 403 });
+        }
+
+        // --- 2.4 计费与限额检查 (Rate Limiting) ---
+        const isWhitelisted = CONFIG.IP_LIMIT_WHITELIST.includes(clientIP);
+        let currentUsage = 0;
+        
+        // 如果未加白名单且绑定了 KV 数据库，则读取当前 IP 的用量
+        if (!isWhitelisted && env.IP_LIMIT_KV) {
+             currentUsage = await getIpUsageCount(clientIP, env);
+             if (currentUsage >= CONFIG.DAILY_LIMIT_COUNT) {
+                 return new Response(`⚠️ Daily Limit Exceeded: ${currentUsage}/${CONFIG.DAILY_LIMIT_COUNT}`, { status: 429 });
+             }
+        }
+
+        // 判断是否为 Docker 镜像下载请求 (用于决定是否扣除额度)
+        // 只有获取 manifest (元数据) 或 blobs (层文件) 才计费
+        const isDockerV2 = url.pathname.startsWith("/v2/");
+        const isDockerCharge = isDockerV2 
+            && (userAgent.includes("docker") || userAgent.includes("go-http") || userAgent.includes("containerd"))
+            && (url.pathname.includes("/manifests/") || url.pathname.includes("/blobs/")) 
+            && request.method === "GET";
+
+        let shouldCharge = false;
+        if (isDockerCharge && !isWhitelisted) {
+            // 使用 Cache API 进行短时间去重 (防止同一个文件请求多次扣费)
+            const isDuplicate = await checkIsDuplicate(clientIP, url.pathname);
+            if (!isDuplicate) {
+                shouldCharge = true;
+                // 异步写入去重标记
+                ctx.waitUntil(setDuplicateFlag(clientIP, url.pathname)); 
+            }
+        }
+
+        // --- 2.5 核心业务路由分发 ---
+        let response;
+        try {
+            if (isDockerV2) {
+                // [分支 1] Docker 镜像加速逻辑 (Docker 客户端通过 Token 认证，无需路径密码)
+                response = await handleDockerRequest(request, url);
+            } else {
+                // [分支 2] 通用代理 / Dashboard / Linux 源
+                const path = url.pathname;
+                
+                // --- 2.5.0 免密/认证逻辑处理 ---
+                // 判断当前请求是否符合“免密”条件：
+                // 1. 客户端 IP 在管理员列表中 (Admin IP)
+                // 2. 请求来源 (Referer) 符合 ALLOW_REFERER 配置
+                const isAdminIp = CONFIG.ADMIN_IPS.includes(clientIP);
+                
+                // [升级] 智能 Referer 检查逻辑
+                let isTrustedReferer = false;
+                if (CONFIG.ALLOW_REFERER && referer) {
+                    const allowedRules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s => s.trim()).filter(s => s);
+                    
+                    for (const rule of allowedRules) {
+                        // 情况 A: 规则包含 "://" (说明是完整 URL 或前缀，如 "https://github.com/Kevin")
+                        if (rule.includes("://")) {
+                            if (referer.startsWith(rule)) {
+                                isTrustedReferer = true;
+                                break;
+                            }
+                        } 
+                        // 情况 B: 规则仅为主机名 (说明是域名，如 "github.com")
+                        else {
+                            try {
+                                const refererUrl = new URL(referer);
+                                // 检查主机名是否完全匹配，或者以 ".域名" 结尾 (允许子域名)
+                                if (refererUrl.hostname === rule || refererUrl.hostname.endsWith("." + rule)) {
+                                    isTrustedReferer = true;
+                                    break;
+                                }
+                            } catch (e) {
+                                // 如果 Referer 不是有效的 URL，降级为字符串包含检查 (容错)
+                                if (referer.includes(rule)) {
+                                    isTrustedReferer = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                const isTrusted = isAdminIp || isTrustedReferer;
+
+                let subPath = "";
+                let isAuthenticated = false;
+
+                // 解析路径结构: /密码/目标URL
+                const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
+
+                // 认证逻辑 A: URL 中携带了正确的密码
+                if (match && match[1] === CONFIG.PASSWORD) {
+                    isAuthenticated = true;
+                    subPath = match[2] || ""; // 提取密码后的部分
+                } 
+                // 认证逻辑 B: 满足信任条件 (免密)
+                else if (isTrusted) {
+                    isAuthenticated = true;
+                    // 在免密模式下，整个路径（去掉开头的/）即为 subPath
+                    // 例如访问 /ubuntu 实际就是请求 ubuntu 模块
+                    subPath = path.substring(1); 
+                }
+
+                // 如果未通过认证，返回 404 (隐藏入口)
+                if (!isAuthenticated) {
+                    return new Response("404 Not Found", { status: 404 });
+                }
+
+                // --- 2.5.1 管理员 API 命令 ---
+                // 注意：重置等敏感操作，建议只允许 IP 验证，防止 Referer 伪造带来的风险
+                // 这里我们加一个判断：只有真正的 ADMIN_IPS 才能执行写操作，Referer 免密只能访问代理
+                if (subPath === "reset") {
+                    if (!isAdminIp) return new Response("Forbidden: Admin IP Required", { status: 403 });
+                    ctx.waitUntil(resetIpUsage(clientIP, env));
+                    return new Response(JSON.stringify({ status: "success" }), { status: 200 });
+                }
+                if (subPath === "reset-all") {
+                    if (!isAdminIp) return new Response("Forbidden: Admin IP Required", { status: 403 });
+                    ctx.waitUntil(resetAllIpStats(env));
+                    return new Response(JSON.stringify({ status: "success" }), { status: 200 });
+                }
+                if (subPath === "stats") {
+                    if (!isAdminIp) return new Response("Forbidden: Admin IP Required", { status: 403 });
+                    const stats = await getAllIpStats(env);
+                    return new Response(JSON.stringify({ status: "success", data: stats }), { status: 200 });
+                }
+
+                // --- 2.5.2 渲染 Dashboard ---
+                // 如果没有提供子路径 (例如只访问 /密码 或 免密访问 /)，则显示 Web 界面
+                if (!subPath) {
+                    return new Response(renderDashboard(url.hostname, CONFIG.PASSWORD, clientIP, currentUsage, CONFIG.DAILY_LIMIT_COUNT, CONFIG.ADMIN_IPS), {
+                        status: 200, headers: { "Content-Type": "text/html;charset=UTF-8" }
+                    });
+                }
+
+                // --- 2.5.3 Linux 软件源加速 ---
+                // 检查子路径是否匹配 Linux 发行版名称 (如 ubuntu, centos)
+                const sortedMirrors = Object.keys(LINUX_MIRRORS).sort((a, b) => b.length - a.length);
+                const linuxDistro = sortedMirrors.find(k => subPath.startsWith(k + '/') || subPath === k);
+
+                // --- 2.5.4 代理模式识别 (Raw vs Recursive) ---
+                let proxyMode = 'raw'; // 默认为纯净模式 (不修改内容)
+                let targetUrlPart = subPath;
+
+                // 如果路径以 'r/' 开头，切换到递归模式 (自动重写内容中的链接)
+                if (subPath.startsWith('r/') || subPath === 'r') {
+                    proxyMode = 'recursive'; 
+                    targetUrlPart = subPath.replace(/^r\/?/, ""); // 移除前缀，获取真实 URL
+                }
+
+                if (linuxDistro) {
+                    // 进入 Linux 源加速逻辑
+                    const realPath = subPath.replace(linuxDistro, '').replace(/^\//, '');
+                    const upstreamBase = LINUX_MIRRORS[linuxDistro];
+                    response = await handleLinuxMirrorRequest(request, upstreamBase, realPath);
+                } else {
+                    // 进入通用文件代理逻辑 (传入模式参数和 ctx 用于缓存)
+                    response = await handleGeneralProxy(request, targetUrlPart + (url.search || ""), CONFIG, proxyMode, ctx);
+                }
+            }
+
+            // --- 2.6 异步计费执行 ---
+            // 如果请求成功且需要计费，则在后台更新 KV，不阻塞响应
+            if (shouldCharge && response && response.status >= 200 && response.status < 400) {
+                ctx.waitUntil(incrementIpUsage(clientIP, env));
+            }
+
+            return response;
+
+        } catch (e) {
+            // 全局错误捕获
+            return new Response(JSON.stringify({ error: e.message }), { status: 500 });
         }
     }
-
-    next();
-});
-
-app.use(checkRateLimit);
-// 解析 raw body，支持大文件流式传输，限制 50mb (主要针对上传，下载流不受此限)
-app.use(express.raw({ type: '*/*', limit: '50mb' }));
+};
 
 // ==============================================================================
-// 4. 路由逻辑
+// 3. 辅助功能函数 (Token, Docker, Linux, KV)
 // ==============================================================================
 
-app.get('/robots.txt', (req, res) => res.type('text/plain').send("User-agent: *\nDisallow: /"));
-app.get('/favicon.ico', (req, res) => res.type('image/svg+xml').send(LIGHTNING_SVG));
-
-// --- 4.1 Docker Token 认证 ---
-// 处理 Docker 客户端的登录/拉取令牌请求
-app.get('/token', async (req, res) => {
-    const scope = req.query.scope;
-    let upstreamAuthUrl = 'https://auth.docker.io/token';
+// --- 3.1 Docker 认证 Token 处理 ---
+// 处理 /token 请求，将其转发给正确的上游 (Docker Hub 或其他 Registry)
+async function handleTokenRequest(request, url) {
+    const scope = url.searchParams.get('scope');
+    let upstreamAuthUrl = 'https://auth.docker.io/token'; // 默认 Docker Hub
     
-    // 根据 scope 判断请求的是哪个 Registry (如 ghcr.io)
+    // 根据 scope 参数判断上游是哪个 Registry
     for (const [domain, _] of Object.entries(REGISTRY_MAP)) {
         if (scope && scope.includes(domain)) {
             upstreamAuthUrl = `https://${domain}/token`;
@@ -263,9 +354,9 @@ app.get('/token', async (req, res) => {
     }
 
     const newUrl = new URL(upstreamAuthUrl);
-    newUrl.search = new URLSearchParams(req.query).toString();
+    newUrl.search = url.search;
 
-    // Docker Hub 特殊处理：补全 library/
+    // Docker Hub 特殊处理：自动补全 library/ 前缀
     if (upstreamAuthUrl === 'https://auth.docker.io/token') {
         newUrl.searchParams.set('service', 'registry.docker.io');
         if (scope && scope.startsWith('repository:')) {
@@ -277,359 +368,476 @@ app.get('/token', async (req, res) => {
         }
     }
 
-    try {
-        const upstreamRes = await fetch(newUrl, {
-            headers: {
-                'User-Agent': 'Docker-Client/24.0.5 (linux)',
-                'Host': newUrl.hostname
-            }
-        });
-        
-        res.status(upstreamRes.status);
-        upstreamRes.headers.forEach((v, k) => res.setHeader(k, v));
-        const data = await upstreamRes.arrayBuffer();
-        res.send(Buffer.from(data));
-    } catch (e) {
-        res.status(500).send(e.message);
-    }
-});
+    const newHeaders = new Headers(request.headers);
+    newHeaders.set('Host', newUrl.hostname);
+    // 伪装 User-Agent，防止被上游屏蔽
+    newHeaders.set('User-Agent', 'Docker-Client/24.0.5 (linux)');
+    newHeaders.delete('Cf-Connecting-Ip');
+    newHeaders.delete('Cf-Worker');
 
-// --- 4.2 Docker V2 API ---
-// 处理实际的 Docker 镜像层下载请求
-app.use('/v2', async (req, res) => {
-    // [新增] 执行扣费 (根路径检查除外)
-    if (req.path !== '/' && req.path !== '') {
-        chargeRequest(getClientIP(req));
-    }
+    return fetch(new Request(newUrl, {
+        method: request.method,
+        headers: newHeaders,
+        redirect: 'follow'
+    }));
+}
 
-    let path = req.path;
-    if (path === '/') path = '';
-    
+// --- 3.2 Docker 核心 V2 API 处理 ---
+async function handleDockerRequest(request, url) {
+    let path = url.pathname.replace(/^\/v2\//, '');
     let targetDomain = 'registry-1.docker.io'; 
     let upstream = 'https://registry-1.docker.io';
-
-    // 根路径检查
+    
+    // 根路径检查 (Docker Client 的连通性测试)
     if (path === '' || path === '/') {
-        try {
-            const rootReq = await fetch('https://registry-1.docker.io/v2/', { 
-                method: req.method, 
-                headers: req.headers 
-            });
-            // 处理 401 认证跳转
-            if (rootReq.status === 401) {
-                const wwwAuth = rootReq.headers.get('WWW-Authenticate');
-                if (wwwAuth) {
-                    const workerOrigin = `${req.protocol}://${req.get('host')}`;
-                    res.setHeader('WWW-Authenticate', wwwAuth.replace(/realm="([^"]+)"/, `realm="${workerOrigin}/token"`));
-                }
-                return res.status(401).send(await rootReq.text());
-            }
-            return res.status(rootReq.status).send(await rootReq.text());
-        } catch (e) { return res.status(500).send(e.message); }
+        const rootReq = new Request('https://registry-1.docker.io/v2/', { method: 'GET', headers: request.headers });
+        const resp = await fetch(rootReq);
+        // 如果返回 401，需要重写 Auth 头，让 Client 向 Worker 请求 Token
+        if (resp.status === 401) {
+            return rewriteAuthHeader(resp, new URL(request.url).origin);
+        }
+        return resp;
     }
 
-    // 路径修正与 Registry 识别
-    const pathParts = path.replace(/^\//, '').split('/');
+    // 路由识别：是 Docker Hub 还是 ghcr.io 等其他仓库
+    const pathParts = path.split('/');
     if (REGISTRY_MAP[pathParts[0]]) {
         targetDomain = pathParts[0];
         upstream = REGISTRY_MAP[pathParts[0]];
-        path = '/' + pathParts.slice(1).join('/');
+        path = pathParts.slice(1).join('/');
     } else if (targetDomain === 'registry-1.docker.io') {
+        // Docker Hub 智能补全 library/
         const p0 = pathParts[0];
         if (pathParts.length > 1 && !p0.includes('.') && p0 !== 'manifests' && p0 !== 'blobs' && p0 !== 'tags' && !p0.startsWith('sha256:')) {
             if (p0 !== 'library') {
                  if (pathParts[1] === 'manifests' || pathParts[1] === 'blobs' || pathParts[1] === 'tags') {
-                     path = '/library' + path;
+                     path = 'library/' + path;
                  }
             }
         }
     }
 
-    const targetUrl = `${upstream}/v2${path}`;
-    const headers = { ...req.headers };
-    headers['Host'] = targetDomain;
-    headers['User-Agent'] = 'Docker-Client/24.0.5 (linux)';
-    delete headers['host']; 
-    delete headers['connection'];
+    const targetUrl = `${upstream}/v2/${path}` + url.search;
+    const newHeaders = new Headers(request.headers);
+    newHeaders.set('Host', targetDomain);
+    newHeaders.set('User-Agent', 'Docker-Client/24.0.5 (linux)');
+    newHeaders.delete('Cf-Connecting-Ip');
+    
+    // 手动处理重定向 (manual)，以便捕获 302 跳转到 S3 的链接
+    const response = await fetch(targetUrl, {
+        method: request.method,
+        headers: newHeaders,
+        body: request.body,
+        redirect: 'manual' 
+    });
+
+    // 处理 401 认证挑战
+    if (response.status === 401) {
+        return rewriteAuthHeader(response, new URL(request.url).origin);
+    }
+
+    // 处理 302 重定向 (Blob 层文件下载)
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+        const location = response.headers.get('Location');
+        if (location) {
+            return handleBlobProxy(location, request);
+        }
+    }
+
+    // 透传其他响应
+    const finalResponse = new Response(response.body, response);
+    finalResponse.headers.set('Access-Control-Allow-Origin', '*');
+    finalResponse.headers.set('Docker-Distribution-API-Version', 'registry/2.0');
+    return finalResponse;
+}
+
+// 辅助：重写 WWW-Authenticate 头，将 Realm 指向 Worker 自己的 /token
+function rewriteAuthHeader(response, workerOrigin) {
+    const newResp = new Response(response.body, response);
+    const auth = response.headers.get('WWW-Authenticate');
+    if (auth) {
+        newResp.headers.set("Www-Authenticate", auth.replace(/realm="([^"]+)"/, `realm="${workerOrigin}/token"`));
+        newResp.headers.set('Access-Control-Allow-Origin', '*');
+    }
+    return newResp;
+}
+
+// --- 3.3 Docker Blob 代理 (S3 中转) ---
+// 代理下载实际的镜像层文件，支持 Range 断点续传
+async function handleBlobProxy(targetUrl, originalRequest) {
+    const newHeaders = new Headers();
+    newHeaders.set('User-Agent', 'Docker-Client/24.0.5 (linux)');
+    const range = originalRequest.headers.get('Range');
+    if (range) newHeaders.set('Range', range);
+
+    const upstreamResponse = await fetch(targetUrl, { 
+        method: 'GET', 
+        headers: newHeaders 
+    });
+    
+    const proxyHeaders = new Headers(upstreamResponse.headers);
+    proxyHeaders.set('Access-Control-Allow-Origin', '*');
+    // 删除可能导致客户端校验失败的压缩头
+    proxyHeaders.delete('Content-Encoding'); 
+    proxyHeaders.delete('Transfer-Encoding');
+
+    return new Response(upstreamResponse.body, {
+        status: upstreamResponse.status,
+        headers: proxyHeaders
+    });
+}
+
+// --- 3.4 KV 计数与工具函数 ---
+function getDate() { return new Date(new Date().getTime() + 28800000).toISOString().split('T')[0]; } // UTC+8
+
+// 使用 Cache API 实现短时间去重 (Dedup)
+async function checkIsDuplicate(ip, path) {
+    const cache = caches.default;
+    const key = `http://dedup.local/${ip}${path}`; 
+    return !!(await cache.match(key)); 
+}
+
+async function setDuplicateFlag(ip, path) {
+    const cache = caches.default;
+    const key = `http://dedup.local/${ip}${path}`;
+    await cache.put(key, new Response("1", { headers: { "Cache-Control": "max-age=5" } }));
+}
+
+// 新增 D1数据库 KV 读取/写入/重置逻辑 
+async function getIpUsageCount(ip, env) {
+    // 优先使用 D1 数据库
+    if (env.DB) {
+        try {
+            const today = getDate();
+            // 只需要读取 count 字段，节省读取行成本
+            const result = await env.DB.prepare("SELECT count FROM ip_limits WHERE ip = ? AND date = ?")
+                .bind(ip, today)
+                .first();
+            return result ? result.count : 0;
+        } catch (e) {
+            console.error("D1 Read Error:", e); // 出错降级到 KV
+        }
+    }
+
+    // 降级使用 KV
+    if (!env.IP_LIMIT_KV) return 0;
+    const val = await env.IP_LIMIT_KV.get(`limit:${ip}:${getDate()}`);
+    return parseInt(val || "0");
+}
+
+async function incrementIpUsage(ip, env) {
+    // 优先使用 D1
+    if (env.DB) {
+        try {
+            const today = getDate();
+            const time = Date.now();
+            // 【省额度核心】Upsert 语法：如果不存在则插入 1，如果存在则 +1。
+            // 这是一个原子操作，且只消耗一次 D1 写入额度。
+            await env.DB.prepare(`
+                INSERT INTO ip_limits (ip, date, count, updated_at) 
+                VALUES (?, ?, 1, ?) 
+                ON CONFLICT(ip, date) 
+                DO UPDATE SET count = count + 1, updated_at = ?
+            `).bind(ip, today, time, time).run();
+            return;
+        } catch (e) {
+            console.error("D1 Write Error:", e);
+        }
+    }
+
+    // 降级使用 KV
+    if (!env.IP_LIMIT_KV) return;
+    const key = `limit:${ip}:${getDate()}`;
+    // 注意：KV 并没有原子加操作，高并发下其实是不准的，D1 解决了这个问题
+    const val = await env.IP_LIMIT_KV.get(key);
+    await env.IP_LIMIT_KV.put(key, (parseInt(val || "0") + 1).toString(), { expirationTtl: 86400 });
+}
+
+async function resetIpUsage(ip, env) {
+    if (env.DB) {
+        try {
+            await env.DB.prepare("DELETE FROM ip_limits WHERE ip = ? AND date = ?")
+                .bind(ip, getDate())
+                .run();
+        } catch(e) { console.error(e); }
+    }
+    
+    // 同时尝试删除 KV (保持数据同步，防止切回 KV 时数据错乱)
+    if (env.IP_LIMIT_KV) {
+        await env.IP_LIMIT_KV.delete(`limit:${ip}:${getDate()}`);
+    }
+}
+
+async function resetAllIpStats(env) {
+    if (env.DB) {
+        // D1 清空非常快，直接 Truncate 或 Delete All
+        try {
+            await env.DB.prepare("DELETE FROM ip_limits").run();
+        } catch(e) { console.error(e); }
+    }
+
+    // 同时也清空 KV
+    if (env.IP_LIMIT_KV) {
+        let cursor = null;
+        do {
+            const list = await env.IP_LIMIT_KV.list({ prefix: `limit:`, limit: 1000, cursor });
+            cursor = list.cursor;
+            for (const key of list.keys) {
+                await env.IP_LIMIT_KV.delete(key.name);
+            }
+        } while (cursor); // 循环删除直到清空
+    }
+}
+
+// 获取全站统计
+async function getAllIpStats(env) {
+    // 优先使用 D1 (性能极高)
+    if (env.DB) {
+        try {
+            const today = getDate();
+            
+            // 1. 获取总请求数 (聚合查询)
+            const sumResult = await env.DB.prepare("SELECT SUM(count) as total, COUNT(*) as unique_ips FROM ip_limits WHERE date = ?").bind(today).first();
+            const total = sumResult.total || 0;
+            const uniqueIps = sumResult.unique_ips || 0;
+
+            // 2. 获取前 100 名详情 (排序查询)
+            const listResult = await env.DB.prepare("SELECT ip, count FROM ip_limits WHERE date = ? ORDER BY count DESC LIMIT 100").bind(today).all();
+            
+            return { 
+                totalRequests: total, 
+                uniqueIps: uniqueIps, 
+                details: listResult.results 
+            };
+        } catch (e) {
+            console.error("D1 Stats Error:", e);
+            // 出错不返回空，尝试走 KV
+        }
+    }
+
+    // 降级 KV 逻辑 (保持原样，用于兼容)
+    if (!env.IP_LIMIT_KV) return { totalRequests: 0, uniqueIps: 0, details: [] };
+    const today = getDate();
+    let total = 0;
+    let details = [];
+    // 注意：KV list 默认一次最多 1000 个，如果量大这里其实显示不全，这是 KV 的劣势
+    const list = await env.IP_LIMIT_KV.list({ prefix: `limit:`, limit: 1000 }); 
+    for (const key of list.keys) {
+        const parts = key.name.split(':');
+        // 过滤掉非今天的 key (如果有历史残留)
+        if (parts.length === 3 && parts[2] === today) {
+            // 这里有个性能坑：KV list 不返回 value，需要再次 get。
+            // 为了不卡死，这里我们只在 KV 模式下做一个简单的近似统计，或者你接受慢一点
+            // 优化：limit.metadata 可以存 count，但这里代码没存，所以只能读
+            const val = await env.IP_LIMIT_KV.get(key.name);
+            const count = parseInt(val || "0");
+            total += count;
+            details.push({ ip: parts[1], count: count });
+        }
+    }
+    // 内存排序
+    details.sort((a, b) => b.count - a.count);
+    // 截取前 100
+    return { totalRequests: total, uniqueIps: details.length, details: details.slice(0, 100) };
+}
+
+// --- 3.5 Linux 软件源加速逻辑 ---
+async function handleLinuxMirrorRequest(request, upstreamBase, path) {
+    const targetUrl = upstreamBase.endsWith('/') 
+        ? upstreamBase + path 
+        : upstreamBase + '/' + path;
+
+    const newHeaders = new Headers(request.headers);
+    newHeaders.delete('Cf-Connecting-Ip');
+    newHeaders.delete('Cf-Worker');
+    newHeaders.delete('Host'); 
+    
+    // 支持 Range 请求 (apt/yum 可能用到)
+    const range = request.headers.get('Range');
+    if (range) {
+        newHeaders.set('Range', range);
+    }
 
     try {
         const response = await fetch(targetUrl, {
-            method: req.method,
-            headers: headers,
-            body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
-            redirect: 'manual'
+            method: request.method,
+            headers: newHeaders,
+            redirect: 'follow'
         });
 
-        // 401 认证处理
-        if (response.status === 401) {
-            const wwwAuth = response.headers.get('WWW-Authenticate');
-            if (wwwAuth) {
-                const workerOrigin = `${req.protocol}://${req.get('host')}`;
-                res.setHeader('WWW-Authenticate', wwwAuth.replace(/realm="([^"]+)"/, `realm="${workerOrigin}/token"`));
-            }
-            return res.status(401).send(await response.text());
+        const responseHeaders = new Headers(response.headers);
+        responseHeaders.set('Access-Control-Allow-Origin', '*');
+        
+        // 透传 Range 相关头
+        if (response.headers.has('Content-Range')) {
+            responseHeaders.set('Content-Range', response.headers.get('Content-Range'));
+        }
+        if (response.headers.has('Accept-Ranges')) {
+            responseHeaders.set('Accept-Ranges', response.headers.get('Accept-Ranges'));
         }
 
-        // 302 重定向处理 (Blob 下载)
-        if ([301, 302, 303, 307, 308].includes(response.status)) {
-            const location = response.headers.get('Location');
-            if (location) {
-                const blobResp = await fetch(location, {
-                    method: 'GET',
-                    headers: { 'User-Agent': 'Docker-Client/24.0.5 (linux)' }
-                });
-                res.status(blobResp.status);
-                blobResp.headers.forEach((v, k) => {
-                    if (k !== 'content-encoding' && k !== 'transfer-encoding') {
-                        res.setHeader(k, v);
-                    }
-                });
-                
-                const arrayBuffer = await blobResp.arrayBuffer();
-                res.send(Buffer.from(arrayBuffer));
-                return;
-            }
-        }
-
-        res.status(response.status);
-        response.headers.forEach((v, k) => res.setHeader(k, v));
-        const arrayBuffer = await response.arrayBuffer();
-        res.send(Buffer.from(arrayBuffer));
+        return new Response(response.body, {
+            status: response.status,
+            headers: responseHeaders
+        });
 
     } catch (e) {
-        res.status(502).send(`Docker Proxy Error: ${e.message}`);
+        return new Response(`Linux Mirror Proxy Error: ${e.message}`, { status: 502 });
     }
-});
+}
 
-// --- 4.3 通用代理入口 (核心逻辑) ---
-// 捕获所有其他请求，处理 Linux源、GitHub加速、通用文件代理
-app.all('*', async (req, res) => {
-    const clientIP = getClientIP(req);
-    const referer = req.headers['referer'] || "";
-    const path = req.path;
+// ==============================================================================
+// 3.6 通用代理逻辑 (核心: Raw vs Recursive)
+// ==============================================================================
+async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw', ctx) {
+    let currentUrlStr = targetUrlStr;
+    
+    // [修改] 容错增强：处理 Cloudflare 合并斜杠问题 (https:/ -> https://) 及补全协议
+    if (currentUrlStr.startsWith("http")) {
+        // 如果自带协议，强制修正斜杠数量为2个
+        currentUrlStr = currentUrlStr.replace(/^(https?):\/+/, '$1://');
+    } else {
+        // 如果没带协议，补全 https://
+        currentUrlStr = 'https://' + currentUrlStr;
+    }
 
-    // --- 认证与信任判断 ---
-    // 1. 判断是否为管理员 IP (免密)
-    const isAdminIp = CONFIG.ADMIN_IPS.includes(clientIP);
+    // --- 缓存检查 (仅针对递归模式) ---
+    // 递归模式涉及正则替换，消耗 CPU，且结果是纯文本，非常适合缓存。
+    // 使用 request.url 作为缓存键。
+    const cache = caches.default;
+    const cacheKey = request.url; 
+    
+    if (mode === 'recursive' && CONFIG.ENABLE_CACHE) {
+        // 尝试从缓存中获取响应
+        const cachedResponse = await cache.match(cacheKey);
+        if (cachedResponse) {
+            // 命中缓存，直接返回 (Response 需要 clone 吗？match 返回的通常可以直接用)
+            return cachedResponse;
+        }
+    }
 
-    // 2. 判断 Referer 是否在允许列表中 (免密)
-    let isTrustedReferer = false;
-    if (CONFIG.ALLOW_REFERER && referer) {
-        const allowedRules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s => s.trim()).filter(s => s);
-        for (const rule of allowedRules) {
-            // A. 完整 URL 前缀匹配 (如 https://github.com/User)
-            if (rule.includes("://")) {
-                if (referer.startsWith(rule)) { isTrustedReferer = true; break; }
-            } 
-            // B. 域名匹配 (如 github.com)
-            else {
-                try {
-                    const refUrl = new URL(referer);
-                    // 允许完全匹配或子域名
-                    if (refUrl.hostname === rule || refUrl.hostname.endsWith("." + rule)) {
-                        isTrustedReferer = true; break;
-                    }
-                } catch(e) {
-                    // 容错：简单的字符串包含
-                    if (referer.includes(rule)) { isTrustedReferer = true; break; }
+    let finalResponse = null;
+    const originalHeaders = new Headers(request.headers);
+
+    try {
+        // --- 1. 手动处理重定向循环 ---
+        // 我们手动跟踪重定向，而不是让 fetch 自动处理，是为了更好地控制 Header 和流程
+        let redirectCount = 0;
+        while (redirectCount < CONFIG.MAX_REDIRECTS) {
+            let currentTargetUrl;
+            try { currentTargetUrl = new URL(currentUrlStr); } catch(e) { return new Response("Invalid URL: " + currentUrlStr, {status: 400}); }
+            
+            // 黑白名单检查
+            const domain = currentTargetUrl.hostname;
+            if (CONFIG.BLACKLIST.some(k => domain.includes(k))) return new Response("Blocked Domain", { status: 403 });
+            if (CONFIG.WHITELIST.length > 0 && !CONFIG.WHITELIST.some(k => domain.includes(k))) return new Response("Blocked (Not Whitelisted)", { status: 403 });
+
+            // 构造请求头
+            const newHeaders = new Headers(originalHeaders);
+            newHeaders.set("Host", currentTargetUrl.hostname);
+            newHeaders.set("Referer", currentTargetUrl.origin + "/"); 
+            newHeaders.set("Origin", currentTargetUrl.origin);
+            
+            // 伪装 User-Agent (许多脚本服务器会拒绝无 UA 的请求或 curl)
+            if (!newHeaders.get("User-Agent")) {
+                newHeaders.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            }
+            
+            // 传递 Range 头 (Raw 模式下下载大文件需要)
+            const range = request.headers.get('Range');
+            if (range) newHeaders.set('Range', range);
+
+            // 清理 Cloudflare 自身产生的头，避免循环或被上游识别
+            newHeaders.delete("Cf-Worker"); newHeaders.delete("Cf-Ray"); newHeaders.delete("Cookie"); newHeaders.delete("X-Forwarded-For");
+            newHeaders.delete("Cf-Connecting-Ip");
+
+            // 发起请求 (redirect: manual)
+            const response = await fetch(currentUrlStr, {
+                method: request.method, headers: newHeaders, body: request.body, redirect: "manual"
+            });
+
+            // 如果是重定向，提取 Location 并继续循环
+            if ([301, 302, 303, 307, 308].includes(response.status)) {
+                const location = response.headers.get("Location");
+                if (location) {
+                    currentUrlStr = new URL(location, currentUrlStr).href;
+                    redirectCount++;
+                    continue;
                 }
             }
+            finalResponse = response;
+            break;
         }
-    }
 
-    const isTrusted = isAdminIp || isTrustedReferer;
+        if (!finalResponse) throw new Error("Too many redirects");
 
-    // --- 路径解析 ---
-    let subPath = "";
-    let isAuthenticated = false;
-
-    // 解析路径结构: /密码/目标URL
-    const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
-
-    // 认证方式 A: URL 携带正确密码
-    if (match && match[1] === CONFIG.PASSWORD) {
-        isAuthenticated = true;
-        subPath = match[2] || ""; 
-    } 
-    // 认证方式 B: 信任来源 (免密)
-    else if (isTrusted) {
-        isAuthenticated = true;
-        // 免密模式下，整个 Path 去掉开头的 / 就是目标路径
-        subPath = path.substring(1); 
-    }
-
-    // 未通过认证 -> 404
-    if (!isAuthenticated) {
-        return res.status(404).send("404 Not Found - Powered by ProxyX");
-    }
-
-// --- 4.3.1 管理员 API (不扣费) ---
-    if (subPath === "reset") {
-        if (!isAdminIp) return res.status(403).send("Forbidden");
-        // SQLite: 删除指定 IP 今日记录
-        stmts.resetIp.run(clientIP, getDate());
-        return res.json({ status: "success" });
-    }
-    if (subPath === "reset-all") {
-        if (!isAdminIp) return res.status(403).send("Forbidden");
-        // SQLite: 清空全表 (重置所有)
-        stmts.resetAll.run();
-        return res.json({ status: "success" });
-    }
-    if (subPath === "stats") {
-        if (!isAdminIp) return res.status(403).send("Forbidden");
-        // SQLite: 直接查询今日所有统计并排序
-        const rows = stmts.stats.all(getDate());
-        const stats = rows.map(r => ({ ip: r.ip, count: r.count }));
-        // 计算总请求数 (可选)
-        const total = stats.reduce((acc, curr) => acc + curr.count, 0);
-        return res.json({ status: "success", data: { totalRequests: total, uniqueIps: stats.length, details: stats } });
-    }
-
-// --- 4.3.2 仪表盘 (不扣费) ---
-    if (!subPath) {
-        let count = 0;
-        try {
-            const row = stmts.get.get(clientIP, getDate());
-            if (row) count = row.count;
-        } catch(e) {}
+        // --- 2. 构造响应头 ---
+        const responseHeaders = new Headers(finalResponse.headers);
+        // 清理安全策略头，允许我们在 Dashboard 中嵌入 (如果有需要) 或跨域使用
+        responseHeaders.delete("Content-Security-Policy"); 
+        responseHeaders.delete("Content-Security-Policy-Report-Only");
+        responseHeaders.delete("Clear-Site-Data");
+        responseHeaders.set("Access-Control-Allow-Origin", "*");
         
-        return res.send(renderDashboard(req.hostname, CONFIG.PASSWORD, clientIP, count, CONFIG.DAILY_LIMIT_COUNT, CONFIG.ADMIN_IPS));
-    }
+        // 调试头：标识当前的代理模式
+        responseHeaders.set("X-Proxy-Mode", mode === 'recursive' ? "Recursive-Force-Text" : "Raw-Passthrough");
 
-    // [删除] 原来的 chargeRequest(clientIP); 已被移除，改为延迟扣费
-
-    // --- 4.3.3 Linux 源加速 ---
-    const sortedMirrors = Object.keys(LINUX_MIRRORS).sort((a, b) => b.length - a.length);
-    const linuxDistro = sortedMirrors.find(k => subPath.startsWith(k + '/') || subPath === k);
-
-    if (linuxDistro) {
-        // [新增] 只有确认是有效的 Linux 源请求，才在这里扣费
-        chargeRequest(clientIP);
-
-        const realPath = subPath.replace(linuxDistro, '').replace(/^\//, '');
-        // ... 后续代码不变 ...
-    }
-
-    // --- 4.3.4 通用文件/递归加速 ---
-    
-    // [1] 递归模式判断
-    let proxyMode = 'raw';
-    let targetUrlStr = subPath;
-
-    if (subPath.startsWith('r/') || subPath === 'r') {
-        proxyMode = 'recursive';
-        targetUrlStr = subPath.replace(/^r\/?/, "");
-    }
-
-    // [2] 自动修正 URL
-    if (!targetUrlStr.startsWith("http")) {
-        targetUrlStr = 'https://' + targetUrlStr;
-    } else {
-        targetUrlStr = targetUrlStr.replace(/^(https?):\/+(?!\/)/, '$1://');
-    }
-
-    // [3] 安全检查 (黑白名单)
-    try {
-        const parsedUrl = new URL(targetUrlStr);
-        const domain = parsedUrl.hostname;
-        
-        // 如果被黑名单拦截，直接返回 403，此时还没执行扣费，所以不扣次数
-        if (CONFIG.BLACKLIST.length > 0 && CONFIG.BLACKLIST.some(k => domain.includes(k))) {
-            return res.status(403).send("Blocked Domain");
-        }
-        // 如果不在白名单，直接返回 403，也不扣次数
-        if (CONFIG.WHITELIST.length > 0 && !CONFIG.WHITELIST.some(k => domain.includes(k))) {
-            return res.status(403).send("Blocked (Not Whitelisted)");
-        }
-    } catch (e) {
-        // URL 格式错误，也不扣次数
-        return res.status(400).send(`Invalid URL: ${targetUrlStr}`);
-    }
-
-    // ===============================================
-    // [新增] 安全检查通过，URL 合法，现在执行扣费！
-    // ===============================================
-    chargeRequest(clientIP);
-
-    // [4] 递归模式缓存检查
-    const cacheKey = req.originalUrl;
-    if (proxyMode === 'recursive' && CONFIG.ENABLE_CACHE) {
-        const cachedBody = myCache.get(cacheKey);
-        if (cachedBody) {
-            res.setHeader('X-Cache-Status', 'HIT');
-            res.setHeader('X-Proxy-Mode', 'Recursive-Cached');
-            return res.send(cachedBody);
-        }
-    }
-
-    // [5] 发起请求
-    try {
-        const headers = { ...req.headers };
-        delete headers['host'];
-        delete headers['connection'];
-        // 伪装 UA 防止被拒绝
-        if (!headers['user-agent']) headers['user-agent'] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-        const upstreamRes = await fetch(targetUrlStr, {
-            method: req.method,
-            headers: headers,
-            body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
-            redirect: 'follow' 
-        });
-
-        res.status(upstreamRes.status);
-        upstreamRes.headers.forEach((v, k) => {
-            // 递归模式下，这些头会导致修改后的 body 长度不匹配，必须删除
-            if (proxyMode === 'recursive' && (k === 'content-encoding' || k === 'content-length' || k === 'transfer-encoding')) return;
-            res.setHeader(k, v);
-        });
-
-        res.setHeader('X-Proxy-Mode', proxyMode === 'recursive' ? 'Recursive-Force-Text' : 'Raw-Passthrough');
-        res.removeHeader('content-security-policy');
-
-        // A. Raw 模式：直接透传二进制流
-        if (proxyMode === 'raw') {
-            const arrayBuffer = await upstreamRes.arrayBuffer();
-            res.send(Buffer.from(arrayBuffer));
-            return;
+        // ==========================================
+        // 模式 A: Raw (纯净模式)
+        // ==========================================
+        // 直接透传流，不修改内容，保持二进制完整性，适合 zip/iso/exe
+        if (mode === 'raw') {
+            return new Response(finalResponse.body, { status: finalResponse.status, headers: responseHeaders });
         }
 
-        // B. 递归模式：文本替换
-        if (proxyMode === 'recursive') {
-            let text = await upstreamRes.text();
-            
-            const workerOrigin = `${req.protocol}://${req.get('host')}`;
-            // 构造代理前缀：如果是免密访问且未使用密码路径，前缀就不带密码；否则带密码
-            const prefixPath = (isTrusted && !path.startsWith('/' + CONFIG.PASSWORD)) ? '' : `/${CONFIG.PASSWORD}`;
-            const proxyBase = `${workerOrigin}${prefixPath}/r/`;
+        // ==========================================
+        // 模式 B: Recursive (递归模式)
+        // ==========================================
+        // 强制读取文本，正则替换所有 http(s) 链接
+        if (mode === 'recursive') {
+            // [关键修复] 删除可能导致客户端解析错误的头
+            // 如果上游返回了 Content-Encoding: gzip，Cloudflare 会自动解压
+            // 如果我们不删除这个头，客户端会以为body还是压缩的，导致报错或乱码
+            responseHeaders.delete("Content-Encoding");
+            responseHeaders.delete("Content-Length"); // 内容长度会变，必须删掉让浏览器重新计算
+            responseHeaders.delete("Transfer-Encoding");
+            responseHeaders.delete("Content-Disposition"); // 防止强制下载
 
-            // 正则替换 http/https 链接，加上代理前缀
+            // 强制读取文本 (Cloudflare 会自动解压 gzip)
+            let text = await finalResponse.text();
+
+            const workerOrigin = new URL(request.url).origin;
+            const proxyBase = `${workerOrigin}/${CONFIG.PASSWORD}/r/`; 
+
+            // 全局正则替换：匹配所有 http:// 或 https:// 开头的链接
+            // 这是一个比较宽泛的正则，能匹配到大多数 URL
             const regex = /(https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))/g;
             
             text = text.replace(regex, (match) => {
-                if (match.includes(workerOrigin)) return match; 
+                // 如果链接已经是本站域名的，则不替换，防止多重嵌套 (proxy of proxy)
+                if (match.includes(workerOrigin)) return match;
+                // 添加 /r/ 前缀，实现递归代理
                 return proxyBase + match;
             });
 
-            // 写入缓存
-            if (CONFIG.ENABLE_CACHE && upstreamRes.status === 200) {
-                myCache.set(cacheKey, text);
+            // 构造新的响应对象
+            const modifiedResponse = new Response(text, { status: finalResponse.status, headers: responseHeaders });
+
+            // --- 写入缓存 (仅在开启且处理成功时) ---
+            if (CONFIG.ENABLE_CACHE && finalResponse.status === 200) {
+                // 克隆响应，因为 body 只能被读取一次
+                const responseToCache = modifiedResponse.clone();
+                // 必须设置 Cache-Control 头，否则 Cloudflare Cache API 不会存储
+                responseToCache.headers.set("Cache-Control", `public, max-age=${CONFIG.CACHE_TTL}`);
+                // 异步写入缓存
+                ctx.waitUntil(cache.put(cacheKey, responseToCache));
             }
 
-            res.send(text);
+            return modifiedResponse;
         }
 
-    } catch (e) {
-        res.status(502).send(`General Proxy Error: ${e.message}`);
-    }
-});
-
-// 启动监听
-app.listen(PORT, () => {
-    console.log(`ProxyX Server running on port ${PORT}`);
-});
-
+    } catch (e) { return new Response(`Proxy Error: ${e.message}`, { status: 502 }); }
+}
 
 // ==============================================================================
 // 4. Dashboard 渲染 (UI 界面 - 最终修复版: 递归模块仓库路径修正)
