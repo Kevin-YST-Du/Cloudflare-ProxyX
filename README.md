@@ -55,7 +55,7 @@ bash install.sh # 执行一键安装
 ```
 git clone https://github.com/Kevin-YST-Du/Cloudflare-ProxyX.git #git我的仓库
 cd Cloudflare-ProxyX # 进入我的目录
-wget https://github.com/Kevin-YST-Du/Cloudflare-ProxyX/releases/download/v3.6.0/proxyx-linux-x64 #下载最新版本的二进制包
+wget https://github.com/Kevin-YST-Du/Cloudflare-ProxyX/releases/download/v3.7.0/proxyx-linux-x64 #下载最新版本的二进制包
 bash install-binary.sh
 ```
 ---
@@ -82,6 +82,7 @@ bash install-binary.sh
 | `DAILY_LIMIT_COUNT` | 额度限制 (KV)每个 IP 每日最大请求次数 | `200` | 否 |
 | `ADMIN_IPS` | 管理员 IP (拥有重置额度、查看统计、清空全站数据的权限)| `127.0.0.1` | 否 |
 | `IP_LIMIT_WHITELIST` | 免额度 IP 白名单 (请求不计入每日限额)| `127.0.0.1` | 否 |
+| `ALLOW_REFERER` | 免密访问增强| `github.com` | 否 |
 
 
 # 📦 重点：KV 命名空间绑定 D1数据库绑定（二选一即可）
@@ -136,17 +137,17 @@ CREATE INDEX IF NOT EXISTS idx_date_count ON ip_limits(date, count DESC);
 
 #### 直接拉取官方镜像 (自动补全 library):
 ```bash
-docker pull [docker.example.com/nginx](https://docker.example.com/nginx)
-docker pull [docker.example.com/mysql:8.0](https://docker.example.com/mysql:8.0)
-docker pull [docker.example.com/alpine](https://docker.example.com/alpine)
+docker pull domain/nginx
+docker pull domain/mysql
+docker pull domain/alpine
 ```
 拉取第三方镜像 (ghcr.io, quay.io 等):
 ```bash
 # GitHub Container Registry
-docker pull [docker.example.com/ghcr.io/username/image:tag](https://docker.example.com/ghcr.io/username/image:tag)
+docker pull domain/ghcr.io/username/image:tag
 
 # Google Container Registry
-docker pull [docker.example.com/gcr.io/google-samples/hello-app:1.0](https://docker.example.com/gcr.io/google-samples/hello-app:1.0)
+docker pull domain/gcr.io/google-samples/hello-app:1.0
 ```
 
 # ❓ 常见问题
