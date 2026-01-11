@@ -4,18 +4,23 @@ FROM node:18-alpine
 # 设置工作目录
 WORKDIR /app
 
-# 1. 先复制依赖描述文件 (利用 Docker 缓存层加速构建)
+# [新增] 安装编译 SQLite 必须的系统依赖 (python3, make, g++)
+RUN apk add --no-cache python3 make g++
+
+# 1. 复制依赖文件
 COPY package.json ./
 
-# 2. 安装生产环境依赖
+# 2. 安装依赖 (此时会自动编译 better-sqlite3)
 RUN npm install --production
 
 # 3. 复制源代码
-# [关键点] 必须复制到 src 目录，因为 package.json 里写的是 "src/server.js"
 COPY src/server.js ./src/server.js
 
-# 暴露端口 21011
+# [新增] 显式创建数据目录，防止权限问题
+RUN mkdir -p /app/data
+
+# 暴露端口
 EXPOSE 21011
 
-# 启动命令 (这会调用 package.json 中的 "start": "node src/server.js")
+# 启动
 CMD ["npm", "start"]
