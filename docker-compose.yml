@@ -2,39 +2,45 @@ version: '3.8'
 
 services:
   proxy:
-    # 使用 GitHub 镜像
-    image: ghcr.io/kevin-yst-du/proxyx
+    # 使用当前目录下的 Dockerfile 构建
+    build: .
     
-    container_name: proxy-vps
+    # 容器名称
+    container_name: proxyx
+    
+    # 自动重启策略：除非手动停止，否则总是重启
     restart: always
     
-    # 网络模式推荐 Host (性能最好，直接使用 VPS 的 21011 端口)
+    # [网络模式] Host 模式直接使用宿主机端口 (性能最好)
+    # 如果需要端口映射，请改为: network_mode: "bridge" 并添加 ports 映射
     network_mode: "host"
-    
-    # 如果不使用 Host 模式，请取消下面 ports 的注释并注释掉 network_mode
-    # ports:
-    #   - "21011:21011"
 
-    # --- 核心环境变量配置 ---
+    # [持久化存储] 关键！确保 SQLite 数据库重启不丢失
+    # 格式: 宿主机路径:容器内路径
+    volumes:
+      - ./data:/app/data
+
+    # [环境变量配置]
     environment:
-      # [基础配置]
+      # --- 基础配置 ---
       - PORT=21011                  # 监听端口
-      - PASSWORD=123456             # 必填：访问密码
-      - MAX_REDIRECTS=5             # 最大重定向次数
-      - ENABLE_CACHE=true           # 开启缓存
-      - CACHE_TTL=3600              # 缓存时间 (秒)
+      - PASSWORD=123456             # 必填：访问密码 (请修改)
+      - MAX_REDIRECTS=5             # 最大重定向次数 (防止死循环)
+      - ENABLE_CACHE=true           # 开启缓存 (推荐 true)
+      - CACHE_TTL=3600              # 缓存时间 (单位: 秒)
 
-      # [访问控制 - 安全]
+      # --- 访问控制 - 安全 ---
       # 留空代表不限制，多个值用逗号分隔
-      - BLACKLIST=                  # 域名黑名单
-      - WHITELIST=                  # 域名白名单
-      - ALLOW_IPS=                  # 仅允许访问的客户端 IP
+      - BLACKLIST=                  # 域名黑名单 (如: baidu.com,qq.com)
+      - WHITELIST=                  # 域名白名单 (设置后仅允许这些域名)
+      - ALLOW_IPS=                  # 仅允许访问的客户端 IP (白名单)
       - ALLOW_COUNTRIES=            # 仅允许访问的国家代码 (如 CN,US)
-      - ALLOW_REFERER=github.com,nodeseek.com  # 允许的引用来源
+      - ALLOW_REFERER=github.com,nodeseek.com  # 允许的引用来源 (免密访问)
 
-      # [额度限制]
+      # --- 额度限制 ---
       - DAILY_LIMIT_COUNT=200       # 每个 IP 每日最大请求次数
 
-      # [权限管理]
-      - ADMIN_IPS=127.0.0.1         # 管理员 IP (替换为你的真实公网 IP)
-      - IP_LIMIT_WHITELIST=127.0.0.1 # 免额度限制的 IP 白名单
+      # --- 权限管理 ---
+      # 注意：127.0.0.1 仅在 host 模式下代表本机，建议添加你的公网 IP
+      - ADMIN_IPS=127.0.0.1         # 管理员 IP (拥有重置额度、查看全站统计的权限)
+      - IP_LIMIT_WHITELIST=127.0.0.1 # 免额度限制的 IP 白名单 (这些 IP 不扣费)
