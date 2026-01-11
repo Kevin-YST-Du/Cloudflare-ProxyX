@@ -5,26 +5,33 @@ services:
     build: .
     container_name: proxyx
     restart: always
-    
-    # Host 模式直接使用宿主机端口
     network_mode: "host"
 
+    # [新增] 挂载数据卷，实现 SQLite 持久化
+    volumes:
+      - ./data:/app/data
+
+# [环境变量配置]
     environment:
       # --- 基础配置 ---
       - PORT=21011                  # 监听端口
-      - PASSWORD=123456             # 访问密码
-      - MAX_REDIRECTS=5             # 最大跳转次数
-      - ENABLE_CACHE=true           # 是否开启缓存
-      - CACHE_TTL=3600              # 缓存时长(秒)
-      
-      # --- 访问控制 ---
-      - BLACKLIST=                  # 黑名单
-      - WHITELIST=                  # 白名单
-      - ALLOW_IPS=                  # 允许的IP
-      - ALLOW_COUNTRIES=            # 允许的国家/地区
-      
-      # --- 额度与权限 ---
-      - DAILY_LIMIT_COUNT=200       # 每日额度
-      - ADMIN_IPS=127.0.0.1         # 管理员IP
-      - IP_LIMIT_WHITELIST=127.0.0.1 # IP白名单
-      - ALLOW_REFERER=github.com,nodeseek.com # 允许的来源域名
+      - PASSWORD=123456             # 必填：访问密码 (请修改)
+      - MAX_REDIRECTS=5             # 最大重定向次数 (防止死循环)
+      - ENABLE_CACHE=true           # 开启缓存 (推荐 true)
+      - CACHE_TTL=3600              # 缓存时间 (单位: 秒)
+
+      # --- 访问控制 - 安全 ---
+      # 留空代表不限制，多个值用逗号分隔
+      - BLACKLIST=                  # 域名黑名单 (如: baidu.com,qq.com)
+      - WHITELIST=                  # 域名白名单 (设置后仅允许这些域名)
+      - ALLOW_IPS=                  # 仅允许访问的客户端 IP (白名单)
+      - ALLOW_COUNTRIES=            # 仅允许访问的国家代码 (如 CN,US)
+      - ALLOW_REFERER=github.com,nodeseek.com  # 允许的引用来源 (免密访问)
+
+      # --- 额度限制 ---
+      - DAILY_LIMIT_COUNT=200       # 每个 IP 每日最大请求次数
+
+      # --- 权限管理 ---
+      # 注意：127.0.0.1 仅在 host 模式下代表本机，建议添加你的公网 IP
+      - ADMIN_IPS=127.0.0.1         # 管理员 IP (拥有重置额度、查看全站统计的权限)
+      - IP_LIMIT_WHITELIST=127.0.0.1 # 免额度限制的 IP 白名单 (这些 IP 不扣费)
