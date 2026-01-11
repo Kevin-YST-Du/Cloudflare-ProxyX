@@ -1,7 +1,7 @@
 {
   "name": "proxyx",
-  "version": "4.8.0",
-  "description": "Ultimate Docker & Linux Recursive Proxy Server with GeoIP",
+  "version": "4.9.0",
+  "description": "Ultimate Docker & Linux Recursive Proxy Server with GeoIP & SQLite Persistence",
   "main": "src/server.js",
   "bin": "src/server.js",
   "scripts": {
@@ -14,7 +14,8 @@
     ],
     "assets": [
       "node_modules/**/*",
-      "node_modules/geoip-lite/data/**/*"
+      "node_modules/geoip-lite/data/**/*",
+      "node_modules/better-sqlite3/build/Release/better_sqlite3.node"
     ],
     "targets": [
       "node18-linux-x64",
@@ -28,7 +29,8 @@
     "express": "^4.18.2",
     "node-cache": "^5.1.2",
     "dotenv": "^16.3.1",
-    "geoip-lite": "^1.4.10"
+    "geoip-lite": "^1.4.10",
+    "better-sqlite3": "^9.4.0"
   },
   "devDependencies": {
     "pkg": "^5.8.1"
