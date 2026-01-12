@@ -1,6 +1,6 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker & Linux 代理 (v4.5 - Referer 增强版)
+ * Cloudflare Worker: 终极 Docker & Linux 代理 (v4.7 - 全能免密增强版)
  * -----------------------------------------------------------------------------------------
  * 核心功能：
  * 1. Docker Hub/GHCR 等镜像仓库加速下载。
@@ -11,6 +11,9 @@
  * 6. Dashboard: 递归加速模块样式与 GitHub 文件加速模块完全一致。
  * 7. [新增] 管理员 IP 免密访问 Dashboard 和代理服务。
  * 8. [升级] ALLOW_REFERER 支持多条规则，兼容纯域名和完整 URL 路径匹配。
+ * 9. [新增] ALLOW_USER_AGENT 支持自定义 UA 免密。
+ * 10.[新增] 免额度 IP (IP_LIMIT_WHITELIST) 自动获得免密访问权限。
+ * 11.[兼容] 完美支持 D1 数据库进行额度统计，自动降级兼容 KV。
  * -----------------------------------------------------------------------------------------
  */
 
@@ -41,7 +44,12 @@ const DEFAULT_CONFIG = {
     nodeseek.com
     `,              
     
-    // --- 额度限制 (依赖 KV 存储) ---
+    // [新增] 指定允许免密访问的 User-Agent (浏览器/客户端标识)。
+    // 只要请求头中的 User-Agent 包含此字符串，即允许免密下载/访问。
+    // 例如设置为 "MySecretKey"，则 curl -A "MySecretKey" 即可直接访问。
+    ALLOW_USER_AGENT: "", 
+
+    // --- 额度限制 (依赖 KV 或 D1 存储) ---
     DAILY_LIMIT_COUNT: 200,           // 每个 IP 每日最大请求次数 (防滥用)
     
     // --- 权限管理 ---
@@ -50,9 +58,9 @@ const DEFAULT_CONFIG = {
     // 2. 重置额度、查看统计、清空全站数据)
     ADMIN_IPS: `
     127.0.0.1
-    `,                    
+    `,                        
     
-    // 免额度 IP 白名单 (这些 IP 的请求不计入每日限额，例如你自己的服务器 IP)
+    // 免额度 IP 白名单 (这些 IP 的请求不计入每日限额，且自动免密访问)
     IP_LIMIT_WHITELIST: `
     127.0.0.1
     `, 
@@ -111,6 +119,8 @@ export default {
             ADMIN_IPS: parseList(env.ADMIN_IPS, DEFAULT_CONFIG.ADMIN_IPS),
             // [修改] 读取 ALLOW_REFERER
             ALLOW_REFERER: env.ALLOW_REFERER || DEFAULT_CONFIG.ALLOW_REFERER,
+            // [新增] 读取 ALLOW_USER_AGENT
+            ALLOW_USER_AGENT: env.ALLOW_USER_AGENT || DEFAULT_CONFIG.ALLOW_USER_AGENT,
             MAX_REDIRECTS: parseInt(env.MAX_REDIRECTS || DEFAULT_CONFIG.MAX_REDIRECTS),
             ENABLE_CACHE: (env.ENABLE_CACHE || "true") === "true",
             CACHE_TTL: parseInt(env.CACHE_TTL || DEFAULT_CONFIG.CACHE_TTL),
@@ -162,11 +172,13 @@ export default {
         }
 
         // --- 2.4 计费与限额检查 (Rate Limiting) ---
+        // 检查当前 IP 是否在【免额度白名单】中
         const isWhitelisted = CONFIG.IP_LIMIT_WHITELIST.includes(clientIP);
         let currentUsage = 0;
         
-        // 如果未加白名单且绑定了 KV 数据库，则读取当前 IP 的用量
-        if (!isWhitelisted && env.IP_LIMIT_KV) {
+        // 如果未加白名单且绑定了 KV/D1 数据库，则读取当前 IP 的用量
+        // [兼容] 支持 D1 (env.DB) 和 KV (env.IP_LIMIT_KV)
+        if (!isWhitelisted && (env.IP_LIMIT_KV || env.DB)) {
              currentUsage = await getIpUsageCount(clientIP, env);
              if (currentUsage >= CONFIG.DAILY_LIMIT_COUNT) {
                  return new Response(`⚠️ Daily Limit Exceeded: ${currentUsage}/${CONFIG.DAILY_LIMIT_COUNT}`, { status: 429 });
@@ -205,7 +217,9 @@ export default {
                 // --- 2.5.0 免密/认证逻辑处理 ---
                 // 判断当前请求是否符合“免密”条件：
                 // 1. 客户端 IP 在管理员列表中 (Admin IP)
-                // 2. 请求来源 (Referer) 符合 ALLOW_REFERER 配置
+                // 2. 客户端 IP 在免额度白名单中 (Whitelist IP) [新增要求: 自动免密]
+                // 3. 请求来源 (Referer) 符合 ALLOW_REFERER 配置
+                // 4. User-Agent 符合 ALLOW_USER_AGENT 配置
                 const isAdminIp = CONFIG.ADMIN_IPS.includes(clientIP);
                 
                 // [升级] 智能 Referer 检查逻辑
@@ -241,7 +255,19 @@ export default {
                     }
                 }
 
-                const isTrusted = isAdminIp || isTrustedReferer;
+                // [新增] User-Agent 免密检查逻辑
+                let isTrustedUA = false;
+                if (CONFIG.ALLOW_USER_AGENT && CONFIG.ALLOW_USER_AGENT.trim() !== "") {
+                    // 如果当前 User-Agent 包含配置的字符串 (不区分大小写)，则通过
+                    if (userAgent.includes(CONFIG.ALLOW_USER_AGENT.toLowerCase())) {
+                        isTrustedUA = true;
+                    }
+                }
+
+                // 综合判断：只要满足 [管理员IP] 或 [免额度IP] 或 [Referer] 或 [UA] 任意一项，即视为受信任
+                // 注意：isWhitelisted 变量已经在 2.4 节定义了 (IP_LIMIT_WHITELIST)
+                // 这实现了：管理员和免额度IP都不需要输入密码
+                const isTrusted = isAdminIp || isWhitelisted || isTrustedReferer || isTrustedUA;
 
                 let subPath = "";
                 let isAuthenticated = false;
