@@ -1,6 +1,6 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker & Linux 代理 (v4.7 - 全能免密增强版)
+ * Cloudflare Worker: 终极 Docker & Linux 代理 (v4.8 - 日志审计 & 免费路径版)
  * -----------------------------------------------------------------------------------------
  * 核心功能：
  * 1. Docker Hub/GHCR 等镜像仓库加速下载。
@@ -14,6 +14,8 @@
  * 9. [新增] ALLOW_USER_AGENT 支持自定义 UA 免密。
  * 10.[新增] 免额度 IP (IP_LIMIT_WHITELIST) 自动获得免密访问权限。
  * 11.[兼容] 完美支持 D1 数据库进行额度统计，自动降级兼容 KV。
+ * 12.[新增] 详细访问日志记录 (IP, URL, 时间)，仅管理员可见。
+ * 13.[新增] 免费路径配置 (FREE_PATHS)，指定的路径不消耗每日额度。
  * -----------------------------------------------------------------------------------------
  */
 
@@ -52,10 +54,25 @@ const DEFAULT_CONFIG = {
     // --- 额度限制 (依赖 KV 或 D1 存储) ---
     DAILY_LIMIT_COUNT: 200,           // 每个 IP 每日最大请求次数 (防滥用)
     
+    // [新增] 免费路径列表 (不消耗额度的路径前缀)
+    // 访问以下开头的路径将不会计入每日限制，通常用于 Linux 软件源
+    FREE_PATHS: `
+    ubuntu
+    debian
+    centos
+    rockylinux
+    almalinux
+    fedora
+    alpine
+    kali
+    termux
+    `,
+
     // --- 权限管理 ---
     // 管理员 IP 列表 (拥有以下权限：
     // 1. 免密码直接访问 Dashboard 和代理路径
-    // 2. 重置额度、查看统计、清空全站数据)
+    // 2. 重置额度、查看统计、清空全站数据
+    // 3. [新增] 查看详细的访问日志)
     ADMIN_IPS: `
     127.0.0.1
     `,                        
@@ -130,6 +147,8 @@ export default {
             ALLOW_COUNTRIES: parseList(env.ALLOW_COUNTRIES, DEFAULT_CONFIG.ALLOW_COUNTRIES),
             DAILY_LIMIT_COUNT: parseInt(env.DAILY_LIMIT_COUNT || DEFAULT_CONFIG.DAILY_LIMIT_COUNT),
             IP_LIMIT_WHITELIST: parseList(env.IP_LIMIT_WHITELIST, DEFAULT_CONFIG.IP_LIMIT_WHITELIST),
+            // [新增] 读取 FREE_PATHS
+            FREE_PATHS: parseList(env.FREE_PATHS, DEFAULT_CONFIG.FREE_PATHS),
         };
 
         const url = new URL(request.url);
@@ -174,11 +193,17 @@ export default {
         // --- 2.4 计费与限额检查 (Rate Limiting) ---
         // 检查当前 IP 是否在【免额度白名单】中
         const isWhitelisted = CONFIG.IP_LIMIT_WHITELIST.includes(clientIP);
+
+        // [新增] 检查当前路径是否在【免费路径列表】中 (如 /ubuntu 等)
+        // 逻辑：去除开头的 / 后，检查是否以免费路径开头
+        const cleanPath = url.pathname.replace(/^\//, '');
+        const isFreePath = CONFIG.FREE_PATHS.some(fp => cleanPath.startsWith(fp));
+
         let currentUsage = 0;
         
-        // 如果未加白名单且绑定了 KV/D1 数据库，则读取当前 IP 的用量
+        // 如果未加白名单 且 不是免费路径 且 绑定了 KV/D1 数据库，则读取当前 IP 的用量
         // [兼容] 支持 D1 (env.DB) 和 KV (env.IP_LIMIT_KV)
-        if (!isWhitelisted && (env.IP_LIMIT_KV || env.DB)) {
+        if (!isWhitelisted && !isFreePath && (env.IP_LIMIT_KV || env.DB)) {
              currentUsage = await getIpUsageCount(clientIP, env);
              if (currentUsage >= CONFIG.DAILY_LIMIT_COUNT) {
                  return new Response(`⚠️ Daily Limit Exceeded: ${currentUsage}/${CONFIG.DAILY_LIMIT_COUNT}`, { status: 429 });
@@ -194,7 +219,10 @@ export default {
             && request.method === "GET";
 
         let shouldCharge = false;
-        if (isDockerCharge && !isWhitelisted) {
+        // 只有当：不是白名单IP 且 不是免费路径 且 (是Docker下载请求 或 普通文件代理请求) 时才计费
+        // 普通文件代理在下面 handleGeneralProxy 成功后标记
+        // 这里先处理 Docker 的预判
+        if (isDockerCharge && !isWhitelisted && !isFreePath) {
             // 使用 Cache API 进行短时间去重 (防止同一个文件请求多次扣费)
             const isDuplicate = await checkIsDuplicate(clientIP, url.pathname);
             if (!isDuplicate) {
@@ -311,6 +339,12 @@ export default {
                     const stats = await getAllIpStats(env);
                     return new Response(JSON.stringify({ status: "success", data: stats }), { status: 200 });
                 }
+                // [新增] 日志查询 API
+                if (subPath === "logs") {
+                    if (!isAdminIp) return new Response("Forbidden: Admin IP Required", { status: 403 });
+                    const logs = await getAccessLogs(env);
+                    return new Response(JSON.stringify({ status: "success", data: logs }), { status: 200 });
+                }
 
                 // --- 2.5.2 渲染 Dashboard ---
                 // 如果没有提供子路径 (例如只访问 /密码 或 免密访问 /)，则显示 Web 界面
@@ -343,13 +377,28 @@ export default {
                 } else {
                     // 进入通用文件代理逻辑 (传入模式参数和 ctx 用于缓存)
                     response = await handleGeneralProxy(request, targetUrlPart + (url.search || ""), CONFIG, proxyMode, ctx);
+                    
+                    // 通用代理如果成功，且不是免费路径，且不是白名单，标记需要计费
+                    if (response.status === 200 && !isWhitelisted && !isFreePath) {
+                         const isDuplicate = await checkIsDuplicate(clientIP, subPath);
+                         if (!isDuplicate) {
+                             shouldCharge = true;
+                             ctx.waitUntil(setDuplicateFlag(clientIP, subPath));
+                         }
+                    }
                 }
             }
 
-            // --- 2.6 异步计费执行 ---
-            // 如果请求成功且需要计费，则在后台更新 KV，不阻塞响应
-            if (shouldCharge && response && response.status >= 200 && response.status < 400) {
-                ctx.waitUntil(incrementIpUsage(clientIP, env));
+            // --- 2.6 异步任务执行 (计费 & 日志) ---
+            if (response && response.status >= 200 && response.status < 400) {
+                // 1. 计费逻辑 (必须同时满足：应收费标志 + 不是免费路径)
+                if (shouldCharge && !isFreePath) {
+                    ctx.waitUntil(incrementIpUsage(clientIP, env));
+                }
+                
+                // 2. [新增] 访问日志记录 (记录 IP, URL, 时间)
+                // 记录所有成功的代理请求，方便管理员审计
+                ctx.waitUntil(logRequest(clientIP, url.pathname, env));
             }
 
             return response;
@@ -362,7 +411,7 @@ export default {
 };
 
 // ==============================================================================
-// 3. 辅助功能函数 (Token, Docker, Linux, KV)
+// 3. 辅助功能函数 (Token, Docker, Linux, KV, Logging)
 // ==============================================================================
 
 // --- 3.1 Docker 认证 Token 处理 ---
@@ -513,8 +562,11 @@ async function handleBlobProxy(targetUrl, originalRequest) {
     });
 }
 
-// --- 3.4 KV 计数与工具函数 ---
-function getDate() { return new Date(new Date().getTime() + 28800000).toISOString().split('T')[0]; } // UTC+8
+// --- 3.4 KV/D1 计数与日志工具函数 ---
+
+// 获取当前日期 UTC+8
+function getDate() { return new Date(new Date().getTime() + 28800000).toISOString().split('T')[0]; }
+function getTime() { return new Date(new Date().getTime() + 28800000).toISOString().replace('T', ' ').substring(0, 19); }
 
 // 使用 Cache API 实现短时间去重 (Dedup)
 async function checkIsDuplicate(ip, path) {
@@ -529,19 +581,61 @@ async function setDuplicateFlag(ip, path) {
     await cache.put(key, new Response("1", { headers: { "Cache-Control": "max-age=5" } }));
 }
 
-// 新增 D1数据库 KV 读取/写入/重置逻辑 
+// [新增] 记录访问日志 (兼容 D1 和 KV)
+async function logRequest(ip, url, env) {
+    const time = getTime();
+    
+    // 优先使用 D1 存储详细日志
+    if (env.DB) {
+        try {
+            // 需要用户先在 D1 建立表: CREATE TABLE IF NOT EXISTS access_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, url TEXT, created_at TEXT);
+            await env.DB.prepare("INSERT INTO access_logs (ip, url, created_at) VALUES (?, ?, ?)").bind(ip, url, time).run();
+        } catch (e) { console.error("D1 Log Error:", e); }
+    } 
+    // 降级使用 KV 存储最近的日志 (List 模式)
+    else if (env.IP_LIMIT_KV) {
+        try {
+            const key = "recent_logs";
+            // 读取现有日志
+            let logs = await env.IP_LIMIT_KV.get(key, { type: "json" }) || [];
+            // 添加新日志到头部
+            logs.unshift({ ip, url, time });
+            // 只保留最近 50 条，防止 KV 超大
+            if (logs.length > 50) logs = logs.slice(0, 50);
+            // 写入 KV
+            await env.IP_LIMIT_KV.put(key, JSON.stringify(logs));
+        } catch (e) { console.error("KV Log Error:", e); }
+    }
+}
+
+// [新增] 获取访问日志
+async function getAccessLogs(env) {
+    // 优先 D1
+    if (env.DB) {
+        try {
+            // 获取最近 100 条
+            const result = await env.DB.prepare("SELECT ip, url, created_at as time FROM access_logs ORDER BY id DESC LIMIT 100").all();
+            return result.results;
+        } catch (e) { return [{ ip: "System", url: "D1 Error or Table Missing", time: getTime() }]; }
+    }
+    // 降级 KV
+    if (env.IP_LIMIT_KV) {
+        return await env.IP_LIMIT_KV.get("recent_logs", { type: "json" }) || [];
+    }
+    return [];
+}
+
 async function getIpUsageCount(ip, env) {
     // 优先使用 D1 数据库
     if (env.DB) {
         try {
             const today = getDate();
-            // 只需要读取 count 字段，节省读取行成本
             const result = await env.DB.prepare("SELECT count FROM ip_limits WHERE ip = ? AND date = ?")
                 .bind(ip, today)
                 .first();
             return result ? result.count : 0;
         } catch (e) {
-            console.error("D1 Read Error:", e); // 出错降级到 KV
+            console.error("D1 Read Error:", e); 
         }
     }
 
@@ -557,8 +651,6 @@ async function incrementIpUsage(ip, env) {
         try {
             const today = getDate();
             const time = Date.now();
-            // 【省额度核心】Upsert 语法：如果不存在则插入 1，如果存在则 +1。
-            // 这是一个原子操作，且只消耗一次 D1 写入额度。
             await env.DB.prepare(`
                 INSERT INTO ip_limits (ip, date, count, updated_at) 
                 VALUES (?, ?, 1, ?) 
@@ -574,7 +666,6 @@ async function incrementIpUsage(ip, env) {
     // 降级使用 KV
     if (!env.IP_LIMIT_KV) return;
     const key = `limit:${ip}:${getDate()}`;
-    // 注意：KV 并没有原子加操作，高并发下其实是不准的，D1 解决了这个问题
     const val = await env.IP_LIMIT_KV.get(key);
     await env.IP_LIMIT_KV.put(key, (parseInt(val || "0") + 1).toString(), { expirationTtl: 86400 });
 }
@@ -588,7 +679,6 @@ async function resetIpUsage(ip, env) {
         } catch(e) { console.error(e); }
     }
     
-    // 同时尝试删除 KV (保持数据同步，防止切回 KV 时数据错乱)
     if (env.IP_LIMIT_KV) {
         await env.IP_LIMIT_KV.delete(`limit:${ip}:${getDate()}`);
     }
@@ -596,13 +686,12 @@ async function resetIpUsage(ip, env) {
 
 async function resetAllIpStats(env) {
     if (env.DB) {
-        // D1 清空非常快，直接 Truncate 或 Delete All
         try {
             await env.DB.prepare("DELETE FROM ip_limits").run();
+             // 可选：是否清空日志？暂不清空日志，只清空额度
         } catch(e) { console.error(e); }
     }
 
-    // 同时也清空 KV
     if (env.IP_LIMIT_KV) {
         let cursor = null;
         do {
@@ -611,23 +700,19 @@ async function resetAllIpStats(env) {
             for (const key of list.keys) {
                 await env.IP_LIMIT_KV.delete(key.name);
             }
-        } while (cursor); // 循环删除直到清空
+        } while (cursor); 
     }
 }
 
 // 获取全站统计
 async function getAllIpStats(env) {
-    // 优先使用 D1 (性能极高)
     if (env.DB) {
         try {
             const today = getDate();
-            
-            // 1. 获取总请求数 (聚合查询)
             const sumResult = await env.DB.prepare("SELECT SUM(count) as total, COUNT(*) as unique_ips FROM ip_limits WHERE date = ?").bind(today).first();
             const total = sumResult.total || 0;
             const uniqueIps = sumResult.unique_ips || 0;
 
-            // 2. 获取前 100 名详情 (排序查询)
             const listResult = await env.DB.prepare("SELECT ip, count FROM ip_limits WHERE date = ? ORDER BY count DESC LIMIT 100").bind(today).all();
             
             return { 
@@ -637,33 +722,24 @@ async function getAllIpStats(env) {
             };
         } catch (e) {
             console.error("D1 Stats Error:", e);
-            // 出错不返回空，尝试走 KV
         }
     }
 
-    // 降级 KV 逻辑 (保持原样，用于兼容)
     if (!env.IP_LIMIT_KV) return { totalRequests: 0, uniqueIps: 0, details: [] };
     const today = getDate();
     let total = 0;
     let details = [];
-    // 注意：KV list 默认一次最多 1000 个，如果量大这里其实显示不全，这是 KV 的劣势
     const list = await env.IP_LIMIT_KV.list({ prefix: `limit:`, limit: 1000 }); 
     for (const key of list.keys) {
         const parts = key.name.split(':');
-        // 过滤掉非今天的 key (如果有历史残留)
         if (parts.length === 3 && parts[2] === today) {
-            // 这里有个性能坑：KV list 不返回 value，需要再次 get。
-            // 为了不卡死，这里我们只在 KV 模式下做一个简单的近似统计，或者你接受慢一点
-            // 优化：limit.metadata 可以存 count，但这里代码没存，所以只能读
             const val = await env.IP_LIMIT_KV.get(key.name);
             const count = parseInt(val || "0");
             total += count;
             details.push({ ip: parts[1], count: count });
         }
     }
-    // 内存排序
     details.sort((a, b) => b.count - a.count);
-    // 截取前 100
     return { totalRequests: total, uniqueIps: details.length, details: details.slice(0, 100) };
 }
 
@@ -737,7 +813,6 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw', c
         // 尝试从缓存中获取响应
         const cachedResponse = await cache.match(cacheKey);
         if (cachedResponse) {
-            // 命中缓存，直接返回 (Response 需要 clone 吗？match 返回的通常可以直接用)
             return cachedResponse;
         }
     }
@@ -822,8 +897,6 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw', c
         // 强制读取文本，正则替换所有 http(s) 链接
         if (mode === 'recursive') {
             // [关键修复] 删除可能导致客户端解析错误的头
-            // 如果上游返回了 Content-Encoding: gzip，Cloudflare 会自动解压
-            // 如果我们不删除这个头，客户端会以为body还是压缩的，导致报错或乱码
             responseHeaders.delete("Content-Encoding");
             responseHeaders.delete("Content-Length"); // 内容长度会变，必须删掉让浏览器重新计算
             responseHeaders.delete("Transfer-Encoding");
@@ -1142,6 +1215,10 @@ select:focus {
   transition: transform 0.2s;
 }
 
+.modal-content-lg {
+    max-width: 800px;
+}
+
 .modal-overlay.open .modal-content {
   transform: scale(1);
 }
@@ -1151,6 +1228,27 @@ select:focus {
   border: 1px solid #334155;
   color: #f1f5f9;
 }
+
+/* Table */
+.log-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.75rem;
+}
+.log-table th {
+    text-align: left;
+    padding: 0.5rem;
+    border-bottom: 1px solid #e2e8f0;
+    opacity: 0.7;
+}
+.log-table td {
+    padding: 0.5rem;
+    border-bottom: 1px solid #f1f5f9;
+    font-family: monospace;
+    word-break: break-all;
+}
+.dark-mode .log-table th { border-color: #334155; }
+.dark-mode .log-table td { border-color: #334155; }
     </style>
 </head>
 <body class="light-mode">
@@ -1192,6 +1290,10 @@ select:focus {
                     <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
                     <span>全站统计</span>
                 </button>
+                <button onclick="openLogsModal()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-purple-100 text-purple-600 border border-purple-200 hover:bg-purple-200 transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm">
+                   <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"></path></svg>
+                   <span>访问日志</span>
+                </button>
                 ` : ''}
               </div>
           </div>
@@ -1202,7 +1304,7 @@ select:focus {
         </div>
         <p class="text-[11px] opacity-60 flex items-center gap-1">
           <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-          失败自动退还额度 · 短时重复请求不扣费。（10s）
+          失败自动退还额度 · 短时重复请求不扣费 · <span class="text-green-600 dark:text-green-400 font-bold">软件源镜像 (Ubuntu 等) 免费不限量</span>
         </p>
 
         <div id="stats-panel" class="hidden mt-4 p-4 rounded-xl bg-gray-50 dark:bg-slate-800/50 border border-gray-200 dark:border-slate-700">
@@ -1392,6 +1494,31 @@ select:focus {
       </div>
     </div>
 
+    <div id="logsModal" class="modal-overlay">
+      <div class="modal-content modal-content-lg">
+         <div class="flex justify-between items-center mb-4">
+             <h3 class="text-lg font-bold">📄 最近访问日志 (Admin)</h3>
+             <button onclick="closeModal('logsModal')" class="text-gray-500 hover:text-gray-700 dark:text-gray-400 dark:hover:text-gray-200">
+                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+             </button>
+         </div>
+         <div class="max-h-[60vh] overflow-y-auto rounded-lg border border-gray-200 dark:border-slate-700">
+             <table class="log-table">
+                 <thead class="bg-gray-50 dark:bg-slate-800 sticky top-0">
+                     <tr>
+                         <th width="20%">时间</th>
+                         <th width="20%">IP</th>
+                         <th width="60%">访问路径</th>
+                     </tr>
+                 </thead>
+                 <tbody id="logs-table-body" class="bg-white dark:bg-slate-900">
+                     <tr><td colspan="3" class="text-center py-4">加载中...</td></tr>
+                 </tbody>
+             </table>
+         </div>
+      </div>
+    </div>
+
     <div id="toast" class="toast bg-slate-800 text-white"></div>
 
     <script>
@@ -1560,7 +1687,7 @@ select:focus {
             
             // 2. 构造两种代理路径 (RawPath 用于 Git, RecursivePath 用于脚本)
             const baseUrl = window.location.origin + '/' + window.WORKER_PASSWORD + '/';
-            const rawProxyUrl = baseUrl + targetUrl;      // 不带 /r/
+            const rawProxyUrl = baseUrl + targetUrl;       // 不带 /r/
             const recursiveProxyUrl = baseUrl + 'r/' + targetUrl; // 带 /r/
 
             // 3. 智能判断生成模式
@@ -1693,7 +1820,7 @@ select:focus {
               else { window.showToast('❌ 操作失败', true); }
             } catch (e) { window.showToast('❌ 网络错误', true); }
           }
-
+          
           window.viewAllStats = async function() {
                 const panel = document.getElementById('stats-panel');
                 panel.classList.toggle('hidden');
@@ -1722,6 +1849,38 @@ select:focus {
                     } else { window.showToast('❌ 获取失败', true); }
                 } catch (e) { console.error(e); window.showToast('❌ 网络错误', true); }
             }
+
+            // --- 新增: 查看日志逻辑 ---
+            window.openLogsModal = function() { document.getElementById('logsModal').classList.add('open'); window.fetchLogs(); }
+            
+            window.fetchLogs = async function() {
+                const tbody = document.getElementById('logs-table-body');
+                tbody.innerHTML = '<tr><td colspan="3" class="text-center py-4">加载中...</td></tr>';
+                try {
+                    const res = await fetch('/' + window.WORKER_PASSWORD + '/logs');
+                    const result = await res.json();
+                    if (res.ok && result.status === "success") {
+                        const logs = result.data;
+                        let html = '';
+                        if (logs && logs.length > 0) {
+                            logs.forEach(log => {
+                                const isMe = log.ip === window.CURRENT_CLIENT_IP;
+                                const ipStyle = isMe ? 'color:#3b82f6;font-weight:bold' : '';
+                                html += '<tr>'
+                                    +   '<td>' + (log.time || log.created_at || '-') + '</td>'
+                                    +   '<td style="' + ipStyle + '">' + (log.ip || '-') + '</td>'
+                                    +   '<td>' + (log.url || '-') + '</td>'
+                                    + '</tr>';
+                            });
+   
+                        } else {
+                            html = '<tr><td colspan="3" class="text-center py-4 opacity-50">暂无访问日志</td></tr>';
+                        }
+                        tbody.innerHTML = html;
+                    } else { tbody.innerHTML = '<tr><td colspan="3" class="text-center py-4 text-red-500">加载失败</td></tr>'; }
+                } catch(e) { console.error(e); tbody.innerHTML = '<tr><td colspan="3" class="text-center py-4 text-red-500">网络错误</td></tr>'; }
+            }
+
       } catch(err) { console.error("Dashboard Script Error:", err); }
     </script>
 </body>
