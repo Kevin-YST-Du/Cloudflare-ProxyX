@@ -81,6 +81,15 @@ const DEFAULT_CONFIG = {
     IP_LIMIT_WHITELIST: `
     127.0.0.1
     `, 
+
+    // [新增] 伪装域名
+    // 当访问没有带正确密码，且不是 Admin/白名单 IP 时，跳转到此地址。
+    // 如果留空 ""，则保持原来的 404 Not Found 行为。
+    // [新增] 伪装内容地址 (反向代理)
+    // 1. 完整 URL: "https://www.baidu.com"
+    // 2. 纯域名: "www.baidu.com" (自动使用 https)
+    // 3. 带路径: "example.com/about"
+    CAMOUFLAGE_URL: "https://blog.spacenb.com",
 };
 
 // 支持的 Docker Registry 上游列表 (用于判断请求是否指向已知的 Registry)
@@ -149,6 +158,8 @@ export default {
             IP_LIMIT_WHITELIST: parseList(env.IP_LIMIT_WHITELIST, DEFAULT_CONFIG.IP_LIMIT_WHITELIST),
             // [新增] 读取 FREE_PATHS
             FREE_PATHS: parseList(env.FREE_PATHS, DEFAULT_CONFIG.FREE_PATHS),
+            // [新增] 读取伪装域名配置
+            CAMOUFLAGE_URL: env.CAMOUFLAGE_URL || DEFAULT_CONFIG.CAMOUFLAGE_URL,
         };
 
         const url = new URL(request.url);
@@ -243,81 +254,103 @@ export default {
                 const path = url.pathname;
                 
                 // --- 2.5.0 免密/认证逻辑处理 ---
-                // 判断当前请求是否符合“免密”条件：
-                // 1. 客户端 IP 在管理员列表中 (Admin IP)
-                // 2. 客户端 IP 在免额度白名单中 (Whitelist IP) [新增要求: 自动免密]
-                // 3. 请求来源 (Referer) 符合 ALLOW_REFERER 配置
-                // 4. User-Agent 符合 ALLOW_USER_AGENT 配置
                 const isAdminIp = CONFIG.ADMIN_IPS.includes(clientIP);
-                
-                // [升级] 智能 Referer 检查逻辑
+                const isWhitelisted = CONFIG.IP_LIMIT_WHITELIST.includes(clientIP);
+
+                // 智能 Referer / UA 检查
                 let isTrustedReferer = false;
                 if (CONFIG.ALLOW_REFERER && referer) {
                     const allowedRules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s => s.trim()).filter(s => s);
-                    
                     for (const rule of allowedRules) {
-                        // 情况 A: 规则包含 "://" (说明是完整 URL 或前缀，如 "https://github.com/Kevin")
-                        if (rule.includes("://")) {
-                            if (referer.startsWith(rule)) {
-                                isTrustedReferer = true;
-                                break;
-                            }
-                        } 
-                        // 情况 B: 规则仅为主机名 (说明是域名，如 "github.com")
-                        else {
-                            try {
-                                const refererUrl = new URL(referer);
-                                // 检查主机名是否完全匹配，或者以 ".域名" 结尾 (允许子域名)
-                                if (refererUrl.hostname === rule || refererUrl.hostname.endsWith("." + rule)) {
-                                    isTrustedReferer = true;
-                                    break;
-                                }
-                            } catch (e) {
-                                // 如果 Referer 不是有效的 URL，降级为字符串包含检查 (容错)
-                                if (referer.includes(rule)) {
-                                    isTrustedReferer = true;
-                                    break;
-                                }
-                            }
+                        if (rule.includes("://") ? referer.startsWith(rule) : (referer.includes(rule))) {
+                            isTrustedReferer = true; break;
                         }
                     }
                 }
-
-                // [新增] User-Agent 免密检查逻辑
                 let isTrustedUA = false;
-                if (CONFIG.ALLOW_USER_AGENT && CONFIG.ALLOW_USER_AGENT.trim() !== "") {
-                    // 如果当前 User-Agent 包含配置的字符串 (不区分大小写)，则通过
-                    if (userAgent.includes(CONFIG.ALLOW_USER_AGENT.toLowerCase())) {
-                        isTrustedUA = true;
-                    }
+                if (CONFIG.ALLOW_USER_AGENT && userAgent.includes(CONFIG.ALLOW_USER_AGENT.toLowerCase())) {
+                    isTrustedUA = true;
                 }
 
-                // 综合判断：只要满足 [管理员IP] 或 [免额度IP] 或 [Referer] 或 [UA] 任意一项，即视为受信任
-                // 注意：isWhitelisted 变量已经在 2.4 节定义了 (IP_LIMIT_WHITELIST)
-                // 这实现了：管理员和免额度IP都不需要输入密码
+                // 综合判断信任状态
                 const isTrusted = isAdminIp || isWhitelisted || isTrustedReferer || isTrustedUA;
 
                 let subPath = "";
                 let isAuthenticated = false;
 
                 // 解析路径结构: /密码/目标URL
+                // 正则说明：匹配以 / 开头，第一段作为密码(match[1])，后面作为子路径(match[2])
                 const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
 
-                // 认证逻辑 A: URL 中携带了正确的密码
+                // [认证逻辑 A]: URL 第一段完全匹配 PASSWORD
                 if (match && match[1] === CONFIG.PASSWORD) {
                     isAuthenticated = true;
                     subPath = match[2] || ""; // 提取密码后的部分
                 } 
-                // 认证逻辑 B: 满足信任条件 (免密)
+                // [认证逻辑 B]: 也就是上面判断的 "isTrusted" (管理员/白名单/Referer)
                 else if (isTrusted) {
                     isAuthenticated = true;
-                    // 在免密模式下，整个路径（去掉开头的/）即为 subPath
-                    // 例如访问 /ubuntu 实际就是请求 ubuntu 模块
-                    subPath = path.substring(1); 
+                    subPath = path.substring(1); // 免密模式下，去除开头的 / 即为目标
                 }
 
-                // 如果未通过认证，返回 404 (隐藏入口)
+                // =========================================================
+                // [伪装逻辑 - 最终防线]
+                // 只要没通过认证 (isAuthenticated == false)，无论是：
+                // 1. 没输密码 (访问根目录 /)
+                // 2. 输错密码 (访问 /wrongpassword)
+                // 3. 恶意扫描 (访问 /admin, /wp-login)
+                // 全部进入这里，显示伪装内容！
+                // =========================================================
                 if (!isAuthenticated) {
+                    let camoStr = CONFIG.CAMOUFLAGE_URL;
+                    
+                    // 只有配置了伪装域名才执行，否则 404
+                    if (camoStr && camoStr.trim() !== "") {
+                        try {
+                            // 智能补全协议 (支持 "baidu.com" 或 "https://baidu.com")
+                            if (!camoStr.startsWith('http://') && !camoStr.startsWith('https://')) {
+                                camoStr = 'https://' + camoStr;
+                            }
+                            const targetUrl = new URL(camoStr);
+                            
+                            // 构造伪装请求
+                            const newHeaders = new Headers(request.headers);
+                            newHeaders.set('Host', targetUrl.hostname);
+                            newHeaders.set('Referer', targetUrl.origin);
+                            // 抹除特征
+                            newHeaders.delete('Cf-Worker');
+                            newHeaders.delete('Cf-Connecting-Ip');
+                            newHeaders.delete('X-Forwarded-For');
+                            newHeaders.delete('Cookie'); // 也是为了防止串号
+
+                            // 补全 User-Agent (如果是 curl 访问，给它伪装个浏览器头，防止被百度拦截)
+                            if (!newHeaders.get('User-Agent') || newHeaders.get('User-Agent').includes('curl')) {
+                                newHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
+                            }
+
+                            // 抓取伪装页内容
+                            const camoResponse = await fetch(targetUrl.toString(), {
+                                method: request.method,
+                                headers: newHeaders,
+                                redirect: 'follow'
+                            });
+
+                            // 处理响应头，移除安全限制以便正常显示
+                            const responseHeaders = new Headers(camoResponse.headers);
+                            responseHeaders.delete('Content-Security-Policy'); 
+                            responseHeaders.delete('X-Frame-Options'); 
+
+                            return new Response(camoResponse.body, {
+                                status: camoResponse.status,
+                                statusText: camoResponse.statusText,
+                                headers: responseHeaders
+                            });
+                        } catch (e) {
+                            // 伪装失败 (如域名填错)，降级为 404
+                            return new Response("404 Not Found", { status: 404 });
+                        }
+                    }
+                    // 没配伪装域名，直接 404
                     return new Response("404 Not Found", { status: 404 });
                 }
 
