@@ -1,6 +1,6 @@
 /**
  * -----------------------------------------------------------------------------------------
- * Cloudflare Worker: 终极 Docker & Linux 代理 (v5.0 - HMAC签名 & 深度审计版)
+ * Cloudflare Worker: 终极 Docker & Linux 代理 (v5.3.0 - 随机伪装增强版)
  * -----------------------------------------------------------------------------------------
  * 核心功能：
  * 1. Docker Hub/GHCR 等镜像仓库加速下载。
@@ -51,7 +51,7 @@ const DEFAULT_CONFIG = {
     ALLOW_REFERER: `
     github.com
     nodeseek.com
-    `,              
+    `,                              
     
     // [新增] 指定允许免密访问的 User-Agent (浏览器/客户端标识)。
     // 只要请求头中的 User-Agent 包含此字符串，即允许免密下载/访问。
@@ -96,7 +96,9 @@ const DEFAULT_CONFIG = {
     // 1. 完整 URL: "https://www.baidu.com"
     // 2. 纯域名: "www.baidu.com" (自动使用 https)
     // 3. 带路径: "example.com/about"
-    CAMOUFLAGE_URL: "blog.spacenb.com,blog.2055555.xyz",
+    CAMOUFLAGE_URL: "blog.spacenb.com,blog.2055555.xyz,www.baidu.com,www.bing.com",
+    // [新增] 伪装模式: random (每次随机洗牌) 或 failover (按顺序尝试)
+    CAMOUFLAGE_MODE: "random",
 };
 
 // 支持的 Docker Registry 上游列表 (用于判断请求是否指向已知的 Registry)
@@ -171,6 +173,7 @@ export default {
             IP_LIMIT_WHITELIST: parseList(env.IP_LIMIT_WHITELIST, DEFAULT_CONFIG.IP_LIMIT_WHITELIST),
             FREE_PATHS: parseList(env.FREE_PATHS, DEFAULT_CONFIG.FREE_PATHS),
             CAMOUFLAGE_URLS: parseList(env.CAMOUFLAGE_URL, DEFAULT_CONFIG.CAMOUFLAGE_URL),
+            CAMOUFLAGE_MODE: (env.CAMOUFLAGE_MODE || DEFAULT_CONFIG.CAMOUFLAGE_MODE).toLowerCase(),
             SIGN_SECRET: env.SIGN_SECRET || DEFAULT_CONFIG.SIGN_SECRET,
         };
 
@@ -317,51 +320,12 @@ export default {
                         }
                     }
 
-                    // --- 伪装逻辑：不 return，生成 response 给 finally 记录日志 ---
+                    // --- 伪装逻辑 (调用 unified function) ---
                     if (!isAuthenticated) {
-                        const camoList = CONFIG.CAMOUFLAGE_URLS || [];
-                        let camoStr = camoList.length > 0 ? camoList[Math.floor(Math.random() * camoList.length)] : "";
-
-                        if (camoStr && camoStr.trim() !== "") {
-                            try {
-                                if (!camoStr.startsWith('http://') && !camoStr.startsWith('https://')) {
-                                    camoStr = 'https://' + camoStr;
-                                }
-
-                                const targetUrl = new URL(camoStr);
-                                const newHeaders = new Headers(request.headers);
-                                newHeaders.set('Host', targetUrl.hostname);
-                                newHeaders.set('Referer', targetUrl.origin);
-                                newHeaders.delete('Cf-Worker');
-                                newHeaders.delete('Cf-Connecting-Ip');
-                                newHeaders.delete('X-Forwarded-For');
-                                newHeaders.delete('Cookie');
-
-                                if (!newHeaders.get('User-Agent') || newHeaders.get('User-Agent').includes('curl')) {
-                                    newHeaders.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36');
-                                }
-
-                                const camoResponse = await fetch(targetUrl.toString(), {
-                                    method: request.method,
-                                    headers: newHeaders,
-                                    redirect: 'follow'
-                                });
-
-                                const responseHeaders = new Headers(camoResponse.headers);
-                                responseHeaders.delete('Content-Security-Policy');
-                                responseHeaders.delete('X-Frame-Options');
-
-                                response = new Response(camoResponse.body, {
-                                    status: camoResponse.status,
-                                    statusText: camoResponse.statusText,
-                                    headers: responseHeaders
-                                });
-
-                                finalUpstream = targetUrl.origin;
-                            } catch (e) {
-                                response = new Response("404 Not Found", { status: 404 });
-                                finalUpstream = "CamouflageError";
-                            }
+                        const camoResult = await tryCamouflage(request, CONFIG);
+                        if (camoResult) {
+                            response = camoResult.response;
+                            finalUpstream = camoResult.upstream;
                         } else {
                             response = new Response("404 Not Found", { status: 404 });
                             finalUpstream = "NotAuthenticated";
@@ -556,8 +520,8 @@ let __D1_SCHEMA_READY = false;
 let __D1_SCHEMA_PROMISE = null;
 
 async function ensureD1Schema(env) {
-    if (!env || !env.DB) return;               // 没绑定 D1 就跳过
-    if (__D1_SCHEMA_READY) return;             // 已经初始化过
+    if (!env || !env.DB) return;                // 没绑定 D1 就跳过
+    if (__D1_SCHEMA_READY) return;              // 已经初始化过
     if (__D1_SCHEMA_PROMISE) return __D1_SCHEMA_PROMISE; // 避免并发重复建表
 
     __D1_SCHEMA_PROMISE = (async () => {
@@ -616,6 +580,71 @@ async function verifyHmac(secret, message, sigHex) {
         return await crypto.subtle.verify("HMAC", key, sigBuf, encoder.encode(message));
     } catch (e) { return false; }
 }
+
+const pickCamouflageOrder = (urls, mode) => {
+    const list = [...urls];
+    if (list.length <= 1) return list;
+    if (mode === "random") {
+        for (let i = list.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [list[i], list[j]] = [list[j], list[i]];
+        }
+    }
+    return list;
+};
+
+const tryCamouflage = async (req, CONFIG) => {
+    const urls = CONFIG.CAMOUFLAGE_URLS || [];
+    if (!urls.length) return null;
+
+    const ordered = pickCamouflageOrder(urls, CONFIG.CAMOUFLAGE_MODE);
+    
+    for (const raw of ordered) {
+        try {
+            let u = raw.trim();
+            if (!u) continue;
+            if (!u.startsWith("http://") && !u.startsWith("https://")) u = "https://" + u;
+
+            const targetUrl = new URL(u);
+            const headers = new Headers();
+            
+            const ua = req.headers.get("User-Agent") || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+            headers.set("User-Agent", ua);
+            headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+            headers.set("Referer", targetUrl.origin);
+
+            const camoRes = await fetch(targetUrl.toString(), {
+                method: "GET",
+                headers: headers,
+                redirect: "follow",
+            });
+
+            const outHeaders = new Headers(camoRes.headers);
+            outHeaders.delete("Content-Security-Policy");
+            outHeaders.delete("X-Frame-Options");
+            // [关键修复]
+            outHeaders.delete("content-encoding");
+            outHeaders.delete("content-length");
+            outHeaders.delete("transfer-encoding");
+            // [关键修复] 禁用缓存，强制刷新
+            outHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate");
+            outHeaders.set("Pragma", "no-cache");
+            outHeaders.set("Expires", "0");
+
+            return {
+                response: new Response(camoRes.body, {
+                    status: camoRes.status,
+                    statusText: camoRes.statusText,
+                    headers: outHeaders
+                }),
+                upstream: targetUrl.origin
+            };
+        } catch (e) {
+            // console.error(`Camouflage failed for ${raw}:`, e.message);
+        }
+    }
+    return null;
+};
 
 // --- 3.1 Docker 认证 Token 处理 ---
 // 处理 /token 请求，将其转发给正确的上游 (Docker Hub 或其他 Registry)
