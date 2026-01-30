@@ -134,7 +134,8 @@ const CONFIG = {
     // 权限与高级功能
     ADMIN_IPS: parseList(process.env.ADMIN_IPS, "127.0.0.1"),
     IP_LIMIT_WHITELIST: parseList(process.env.IP_LIMIT_WHITELIST, "127.0.0.1"),
-    CAMOUFLAGE_URL: process.env.CAMOUFLAGE_URL || "",
+    CAMOUFLAGE_URLS: parseList(process.env.CAMOUFLAGE_URL, ""),
+    CAMOUFLAGE_MODE: (process.env.CAMOUFLAGE_MODE || "failover").toLowerCase(),
     SIGN_SECRET: process.env.SIGN_SECRET || "change-me-to-a-secure-random-string",
 };
 
@@ -169,6 +170,81 @@ const LINUX_MIRRORS = {
 };
 
 const LIGHTNING_SVG = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" stroke="#F59E0B" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+
+const pickCamouflageOrder = (urls, mode) => {
+    const list = (urls || []).slice();
+    if (list.length <= 1) return list;
+
+    if (mode === "random") {
+        // Fisher–Yates shuffle
+        for (let i = list.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [list[i], list[j]] = [list[j], list[i]];
+        }
+    }
+    // failover: 保持原顺序
+    return list;
+};
+
+const buildCamouflageHeaders = (req, targetUrl) => {
+    const h = new Headers();
+
+    // 尽量模拟正常浏览器请求
+    const ua = req.headers['user-agent'] || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+    h.set("User-Agent", ua);
+    h.set("Accept", req.headers["accept"] || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    h.set("Accept-Language", req.headers["accept-language"] || "zh-CN,zh;q=0.9,en;q=0.8");
+    h.set("Cache-Control", "no-cache");
+    h.set("Pragma", "no-cache");
+    h.set("Referer", targetUrl.origin);
+
+    // 不要把用户的真实 Cookie / 授权头带过去
+    // 也不要带 Host（由 fetch 自动处理或我们自己指定）
+    return h;
+};
+
+const tryCamouflage = async (req) => {
+    const urls = CONFIG.CAMOUFLAGE_URLS || [];
+    if (!urls.length) return null;
+
+    const ordered = pickCamouflageOrder(urls, CONFIG.CAMOUFLAGE_MODE);
+    let lastErr = null;
+
+    for (const raw of ordered) {
+        try {
+            let u = raw.trim();
+            if (!u) continue;
+            if (!u.startsWith("http://") && !u.startsWith("https://")) u = "https://" + u;
+
+            const targetUrl = new URL(u);
+            const headers = buildCamouflageHeaders(req, targetUrl);
+
+            const camoRes = await fetch(targetUrl.toString(), {
+                method: "GET",               // 伪装建议固定 GET（更像“打开网页”）
+                headers,
+                redirect: "follow",
+            });
+
+            // 复制响应（过滤一些可能导致页面不显示的头）
+            const outHeaders = new Headers(camoRes.headers);
+            outHeaders.delete("Content-Security-Policy");
+            outHeaders.delete("X-Frame-Options");
+
+            const buf = await camoRes.arrayBuffer();
+            return {
+                status: camoRes.status,
+                headers: outHeaders,
+                body: Buffer.from(buf),
+                upstream: targetUrl.origin
+            };
+        } catch (e) {
+            lastErr = e;
+        }
+    }
+
+    // 全部失败返回 null（你也可以选择返回一个“假的页面”）
+    return null;
+};
 
 // ==============================================================================
 // 3. 辅助函数
@@ -486,18 +562,17 @@ app.all('*', async (req, res) => {
 
     // 未认证 -> 伪装或 404
     if (!isAuthenticated) {
-        if (CONFIG.CAMOUFLAGE_URL) {
-            try {
-                // 简单的伪装请求转发
-                const camoRes = await fetch(CONFIG.CAMOUFLAGE_URL);
-                res.status(camoRes.status);
-                // 复制部分 Header
-                res.send(Buffer.from(await camoRes.arrayBuffer()));
-                return;
-            } catch(e) {}
-        }
-        return res.status(404).send("404 Not Found - Powered by ProxyX");
+    const camo = await tryCamouflage(req);
+    if (camo) {
+        res.status(camo.status);
+        camo.headers.forEach((v, k) => res.setHeader(k, v));
+        // 可选：加个极低存在感的 header（不建议太显眼）
+        // res.setHeader('X-Powered-By', 'nginx');
+        res.send(camo.body);
+        return;
     }
+    return res.status(404).send("404 Not Found - Powered by ProxyX");
+}
 
     // --- 管理员 API (不扣费，不记录普通日志) ---
     // [权限控制] 仅 Admin IP 可操作，Referer 免密无权操作
