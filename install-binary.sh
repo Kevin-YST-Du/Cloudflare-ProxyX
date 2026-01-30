@@ -43,7 +43,7 @@ else
 fi
 
 # --- 1. 基础信息获取 ---
-echo "🚀 开始安装 VPS 代理服务 (二进制版)..."
+echo "🚀 开始安装 VPS 代理服务 (二进制版 v5.0)..."
 echo "--------------------------------"
 
 read -p "请设置服务端口 [默认 $DEFAULT_PORT]: " input_port
@@ -60,6 +60,8 @@ echo "📂 创建安装目录: $INSTALL_DIR"
 systemctl stop proxyx 2>/dev/null
 rm -rf $INSTALL_DIR
 mkdir -p $INSTALL_DIR
+# [关键] 创建数据目录，确保 SQLite 可写入
+mkdir -p $INSTALL_DIR/data
 
 echo "📦 安装二进制文件..."
 cp "$BINARY_NAME" "$INSTALL_DIR/server"
@@ -88,6 +90,12 @@ VAR_DAILY_LIMIT_COUNT=200
 VAR_ADMIN_IPS="127.0.0.1"
 VAR_IP_LIMIT_WHITELIST="127.0.0.1"
 VAR_ALLOW_REFERER="github.com,nodeseek.com"
+
+# v5.0 新增默认值
+VAR_SIGN_SECRET="change-me-to-a-secure-random-string"
+VAR_ALLOW_USER_AGENT=""
+VAR_FREE_PATHS="ubuntu,debian,centos,rockylinux,almalinux,fedora,alpine,kali,termux"
+VAR_CAMOUFLAGE_URL=""
 
 if [ "$config_choice" == "2" ]; then
     echo -e "\n--- 进入高级配置模式 (直接回车保持默认值) ---"
@@ -131,6 +139,20 @@ if [ "$config_choice" == "2" ]; then
     
     read -p "允许的引用来源 (免密访问) [默认 github.com,nodeseek.com]: " input_ref
     VAR_ALLOW_REFERER=${input_ref:-"github.com,nodeseek.com"}
+
+    # v5.0 新增配置
+    echo "--- v5.0 高级功能 ---"
+    read -p "HMAC 签名密钥 (用于生成免密链接) [默认随机字符串]: " input_sign
+    VAR_SIGN_SECRET=${input_sign:-"change-me-to-a-secure-random-string"}
+
+    read -p "允许免密访问的 User-Agent [默认为空]: " input_ua
+    VAR_ALLOW_USER_AGENT=${input_ua:-""}
+
+    read -p "免费路径列表 (不消耗额度) [默认 Linux 源]: " input_free
+    VAR_FREE_PATHS=${input_free:-"ubuntu,debian,centos,rockylinux,almalinux,fedora,alpine,kali,termux"}
+
+    read -p "伪装域名 (未授权访问时跳转) [默认为空]: " input_camo
+    VAR_CAMOUFLAGE_URL=${input_camo:-""}
     
     echo "--------------------------------"
 fi
@@ -139,10 +161,10 @@ echo "📄 正在写入 .env 配置文件..."
 cat > "$INSTALL_DIR/.env" <<EOF
 # --- 基础配置 ---
 PORT=$PORT                  # 监听端口
-PASSWORD=$PASSWORD             # 必填：访问密码 (请修改)
-MAX_REDIRECTS=$VAR_MAX_REDIRECTS      # 最大重定向次数 (防止死循环)
-ENABLE_CACHE=$VAR_ENABLE_CACHE           # 开启缓存 (推荐 true)
-CACHE_TTL=$VAR_CACHE_TTL              # 缓存时间 (单位: 秒)
+PASSWORD=$PASSWORD              # 必填：访问密码 (请修改)
+MAX_REDIRECTS=$VAR_MAX_REDIRECTS       # 最大重定向次数 (防止死循环)
+ENABLE_CACHE=$VAR_ENABLE_CACHE            # 开启缓存 (推荐 true)
+CACHE_TTL=$VAR_CACHE_TTL               # 缓存时间 (单位: 秒)
 
 # --- 访问控制 (留空代表允许所有) ---
 BLACKLIST=$VAR_BLACKLIST              # 域名黑名单 (如: baidu.com,qq.com)
@@ -151,10 +173,16 @@ ALLOW_IPS=$VAR_ALLOW_IPS              # 仅允许访问的客户端 IP (白名�
 ALLOW_COUNTRIES=$VAR_ALLOW_COUNTRIES        # 仅允许访问的国家代码 (如 CN,US)
 
 # --- 额度与权限 ---
-DAILY_LIMIT_COUNT=$VAR_DAILY_LIMIT_COUNT      # 每个 IP 每日最大请求次数
-ADMIN_IPS=$VAR_ADMIN_IPS              # 管理员 IP (拥有重置额度、查看全站统计的权限)
-IP_LIMIT_WHITELIST=$VAR_IP_LIMIT_WHITELIST     # 免额度限制的 IP 白名单 (这些 IP 不扣费)
-ALLOW_REFERER=$VAR_ALLOW_REFERER          # 允许的引用来源 (免密访问)
+DAILY_LIMIT_COUNT=$VAR_DAILY_LIMIT_COUNT       # 每个 IP 每日最大请求次数
+ADMIN_IPS=$VAR_ADMIN_IPS               # 管理员 IP (拥有重置额度、查看全站统计的权限)
+IP_LIMIT_WHITELIST=$VAR_IP_LIMIT_WHITELIST      # 免额度限制的 IP 白名单 (这些 IP 不扣费)
+ALLOW_REFERER=$VAR_ALLOW_REFERER           # 允许的引用来源 (免密访问)
+
+# --- v5.0 高级功能 ---
+SIGN_SECRET=$VAR_SIGN_SECRET            # HMAC 签名密钥 (务必修改此值以确保安全)
+ALLOW_USER_AGENT=$VAR_ALLOW_USER_AGENT       # 允许免密访问的 User-Agent
+FREE_PATHS=$VAR_FREE_PATHS          # 免费路径列表 (不消耗额度)
+CAMOUFLAGE_URL=$VAR_CAMOUFLAGE_URL         # 伪装域名 (未授权访问时跳转)
 EOF
 
 # --- 4. 配置 Systemd 服务 ---
@@ -195,8 +223,9 @@ systemctl restart proxyx
 # --- 7. 输出结果 ---
 PUBLIC_IP=$(curl -s ifconfig.me || echo "你的服务器IP")
 echo "--------------------------------"
-echo "✅ 安装完成！(二进制版)"
+echo "✅ 安装完成！(二进制版 v5.0)"
 echo "🌐 访问地址: http://$PUBLIC_IP:$PORT/$PASSWORD/"
 echo "📂 配置文件: $INSTALL_DIR/.env"
+echo "📂 数据目录: $INSTALL_DIR/data (SQLite数据库)"
 echo "🔍 查看状态: systemctl status proxyx"
 echo "--------------------------------"
