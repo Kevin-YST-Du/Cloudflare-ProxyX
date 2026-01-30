@@ -26,7 +26,6 @@ services:
       - WHITELIST=                  # 域名白名单 (设置后仅允许这些域名)
       - ALLOW_IPS=                  # 仅允许访问的客户端 IP (白名单)
       - ALLOW_COUNTRIES=            # 仅允许访问的国家代码 (如 CN,US)
-      - ALLOW_REFERER=github.com,nodeseek.com  # 允许的引用来源 (免密访问)
 
       # --- 额度限制 ---
       - DAILY_LIMIT_COUNT=200       # 每个 IP 每日最大请求次数
