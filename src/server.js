@@ -23,7 +23,7 @@ const http = require('http');
 const https = require('https');
 const geoip = require('geoip-lite');
 const Database = require('better-sqlite3');
-const crypto = require('crypto'); // 用于 HMAC 签名
+const crypto = require('crypto');
 
 // --- 1. 智能加载配置 (.env) ---
 const envPath = process.pkg 
@@ -47,57 +47,29 @@ const PORT = process.env.PORT || 21011;
 // 1.1 数据库初始化 (SQLite)
 // ==============================================================================
 const dataDir = path.join(process.cwd(), 'data');
-if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-}
-
+if (!fs.existsSync(dataDir)) { fs.mkdirSync(dataDir, { recursive: true }); }
 const dbPath = path.join(dataDir, 'proxyx.db');
 const db = new Database(dbPath);
 
-// 1. 额度表
+// 建表
 db.exec(`
   CREATE TABLE IF NOT EXISTS rate_limits (
-    ip TEXT NOT NULL,
-    date TEXT NOT NULL,
-    count INTEGER DEFAULT 0,
-    PRIMARY KEY (ip, date)
-  )
-`);
-
-// 2. 日志表 (对应 Worker v5.0 的 access_logs)
-db.exec(`
+    ip TEXT NOT NULL, date TEXT NOT NULL, count INTEGER DEFAULT 0, PRIMARY KEY (ip, date)
+  );
   CREATE TABLE IF NOT EXISTS access_logs (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ip TEXT,
-    url TEXT,
-    created_at TEXT,
-    status INTEGER,
-    upstream TEXT,
-    duration INTEGER,
-    bytes INTEGER,
-    cache_hit INTEGER
-  )
+    id INTEGER PRIMARY KEY AUTOINCREMENT, ip TEXT, url TEXT, created_at TEXT, 
+    status INTEGER, upstream TEXT, duration INTEGER, bytes INTEGER, cache_hit INTEGER
+  );
 `);
 
-// 预编译 SQL 语句
 const stmts = {
-    // 额度相关
     getLimit: db.prepare('SELECT count FROM rate_limits WHERE ip = ? AND date = ?'),
-    upsertLimit: db.prepare(`
-        INSERT INTO rate_limits (ip, date, count) VALUES (@ip, @date, 1)
-        ON CONFLICT(ip, date) DO UPDATE SET count = count + 1
-    `),
+    upsertLimit: db.prepare(`INSERT INTO rate_limits (ip, date, count) VALUES (@ip, @date, 1) ON CONFLICT(ip, date) DO UPDATE SET count = count + 1`),
     resetIp: db.prepare('DELETE FROM rate_limits WHERE ip = ? AND date = ?'),
     resetAllLimits: db.prepare('DELETE FROM rate_limits'),
     getStats: db.prepare('SELECT ip, count FROM rate_limits WHERE date = ? ORDER BY count DESC'),
-    
-    // 日志相关
-    insertLog: db.prepare(`
-        INSERT INTO access_logs (ip, url, created_at, status, upstream, duration, bytes, cache_hit)
-        VALUES (@ip, @url, @created_at, @status, @upstream, @duration, @bytes, @cache_hit)
-    `),
+    insertLog: db.prepare(`INSERT INTO access_logs (ip, url, created_at, status, upstream, duration, bytes, cache_hit) VALUES (@ip, @url, @created_at, @status, @upstream, @duration, @bytes, @cache_hit)`),
     getLogs: db.prepare('SELECT * FROM access_logs ORDER BY id DESC LIMIT 500'),
-    deleteLogsById: (ids) => db.prepare(`DELETE FROM access_logs WHERE id IN (${ids})`),
     deleteLogsByDate: db.prepare("DELETE FROM access_logs WHERE created_at < datetime('now', '-' || ? || ' days', 'localtime')"),
     resetAllLogs: db.prepare('DELETE FROM access_logs')
 };
@@ -107,109 +79,76 @@ console.log(`[Database] SQLite connected at ${dbPath}`);
 // ==============================================================================
 // 2. 全局配置定义
 // ==============================================================================
-
-const parseList = (val, defaultVal) => {
-    const source = val || defaultVal || "";
-    return source.split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
-};
+const parseList = (val, d) => (val || d || "").split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
 
 const CONFIG = {
     PASSWORD: process.env.PASSWORD || "123456",
     MAX_REDIRECTS: parseInt(process.env.MAX_REDIRECTS || "5"),
     ENABLE_CACHE: (process.env.ENABLE_CACHE || "true") === "true",
     CACHE_TTL: cacheTTL,
-    
-    // 安全与访问控制
     BLACKLIST: parseList(process.env.BLACKLIST, ""),
     WHITELIST: parseList(process.env.WHITELIST, ""),
     ALLOW_IPS: parseList(process.env.ALLOW_IPS, ""),
     ALLOW_COUNTRIES: parseList(process.env.ALLOW_COUNTRIES, ""),
     ALLOW_REFERER: process.env.ALLOW_REFERER || "",
     ALLOW_USER_AGENT: process.env.ALLOW_USER_AGENT || "",
-    
-    // 额度与路径
     DAILY_LIMIT_COUNT: parseInt(process.env.DAILY_LIMIT_COUNT || "200"),
     FREE_PATHS: parseList(process.env.FREE_PATHS, "ubuntu,debian,centos,rockylinux,almalinux,fedora,alpine,kali,termux"),
-    
-    // 权限与高级功能
     ADMIN_IPS: parseList(process.env.ADMIN_IPS, "127.0.0.1"),
     IP_LIMIT_WHITELIST: parseList(process.env.IP_LIMIT_WHITELIST, "127.0.0.1"),
-    CAMOUFLAGE_URLS: parseList(process.env.CAMOUFLAGE_URL, ""),
-    CAMOUFLAGE_MODE: (process.env.CAMOUFLAGE_MODE || "failover").toLowerCase(),
     SIGN_SECRET: process.env.SIGN_SECRET || "change-me-to-a-secure-random-string",
+    // 伪装相关配置
+    CAMOUFLAGE_URLS: parseList(process.env.CAMOUFLAGE_URL, ""),
+    CAMOUFLAGE_MODE: (process.env.CAMOUFLAGE_MODE || "random").toLowerCase(),
 };
 
-// Docker & Linux 配置 (保持与 Worker 一致)
-const REGISTRY_MAP = {
-    'ghcr.io': 'https://ghcr.io',
-    'quay.io': 'https://quay.io',
-    'gcr.io': 'https://gcr.io',
-    'k8s.gcr.io': 'https://k8s.gcr.io',
-    'registry.k8s.io': 'https://registry.k8s.io',
-    'docker.cloudsmith.io': 'https://docker.cloudsmith.io',
-    'nvcr.io': 'https://nvcr.io',
-    'mcr.microsoft.com': 'https://mcr.microsoft.com',
-    'public.ecr.aws': 'https://public.ecr.aws',
-    'registry.gitlab.com': 'https://registry.gitlab.com'
-};
-
-const LINUX_MIRRORS = {
-    'ubuntu': 'http://archive.ubuntu.com/ubuntu',
-    'ubuntu-security': 'http://security.ubuntu.com/ubuntu',
-    'debian': 'http://deb.debian.org/debian',
-    'debian-security': 'http://security.debian.org/debian-security',
-    'centos': 'https://vault.centos.org',
-    'centos-stream': 'http://mirror.stream.centos.org',
-    'rockylinux': 'https://download.rockylinux.org/pub/rocky',
-    'almalinux': 'https://repo.almalinux.org/almalinux',
-    'fedora': 'https://download.fedoraproject.org/pub/fedora/linux',
-    'alpine': 'http://dl-cdn.alpinelinux.org/alpine',
-    'kali': 'http://http.kali.org/kali',
-    'archlinux': 'https://geo.mirror.pkgbuild.com',
-    'termux': 'https://packages.termux.org/apt/termux-main'
-};
-
+// Docker & Linux Maps
+const REGISTRY_MAP = { 'ghcr.io': 'https://ghcr.io', 'quay.io': 'https://quay.io', 'gcr.io': 'https://gcr.io', 'k8s.gcr.io': 'https://k8s.gcr.io', 'registry.k8s.io': 'https://registry.k8s.io', 'docker.cloudsmith.io': 'https://docker.cloudsmith.io', 'nvcr.io': 'https://nvcr.io', 'mcr.microsoft.com': 'https://mcr.microsoft.com', 'public.ecr.aws': 'https://public.ecr.aws', 'registry.gitlab.com': 'https://registry.gitlab.com' };
+const LINUX_MIRRORS = { 'ubuntu': 'http://archive.ubuntu.com/ubuntu', 'ubuntu-security': 'http://security.ubuntu.com/ubuntu', 'debian': 'http://deb.debian.org/debian', 'debian-security': 'http://security.debian.org/debian-security', 'centos': 'https://vault.centos.org', 'centos-stream': 'http://mirror.stream.centos.org', 'rockylinux': 'https://download.rockylinux.org/pub/rocky', 'almalinux': 'https://repo.almalinux.org/almalinux', 'fedora': 'https://download.fedoraproject.org/pub/fedora/linux', 'alpine': 'http://dl-cdn.alpinelinux.org/alpine', 'kali': 'http://http.kali.org/kali', 'archlinux': 'https://geo.mirror.pkgbuild.com', 'termux': 'https://packages.termux.org/apt/termux-main' };
 const LIGHTNING_SVG = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" stroke="#F59E0B" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
-const pickCamouflageOrder = (urls, mode) => {
-    const list = (urls || []).slice();
-    if (list.length <= 1) return list;
+// ==============================================================================
+// 3. 辅助函数
+// ==============================================================================
+const getClientIP = (req) => (req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket.remoteAddress || '0.0.0.0').replace(/^.*:/, '');
+const getDate = () => new Date(new Date().getTime() + 28800000).toISOString().split('T')[0];
+const getTime = () => new Date(new Date().getTime() + 28800000).toISOString().replace('T', ' ').substring(0, 19);
 
+const chargeRequest = (ip) => {
+    if (CONFIG.IP_LIMIT_WHITELIST.includes(ip)) return;
+    try { stmts.upsertLimit.run({ ip, date: getDate() }); } catch (e) { console.error("DB Charge Error:", e); }
+};
+
+const logRequest = (ip, url, status, upstream, duration, bytes, cache_hit) => {
+    try { stmts.insertLog.run({ ip, url, created_at: getTime(), status, upstream, duration, bytes, cache_hit: cache_hit ? 1 : 0 }); } catch (e) {}
+};
+
+const verifyHmac = (secret, message, sigHex) => {
+    try { const hmac = crypto.createHmac('sha256', secret); hmac.update(message); return hmac.digest('hex') === sigHex; } catch (e) { return false; }
+};
+const generateHmac = (secret, message) => { const hmac = crypto.createHmac('sha256', secret); hmac.update(message); return hmac.digest('hex'); };
+
+// 伪装策略逻辑
+const pickCamouflageOrder = (urls, mode) => {
+    const list = [...urls];
+    if (list.length <= 1) return list;
     if (mode === "random") {
-        // Fisher–Yates shuffle
         for (let i = list.length - 1; i > 0; i--) {
             const j = Math.floor(Math.random() * (i + 1));
             [list[i], list[j]] = [list[j], list[i]];
         }
     }
-    // failover: 保持原顺序
+    // failover 模式不打乱，保持原顺序
     return list;
 };
 
-const buildCamouflageHeaders = (req, targetUrl) => {
-    const h = new Headers();
-
-    // 尽量模拟正常浏览器请求
-    const ua = req.headers['user-agent'] || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-    h.set("User-Agent", ua);
-    h.set("Accept", req.headers["accept"] || "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
-    h.set("Accept-Language", req.headers["accept-language"] || "zh-CN,zh;q=0.9,en;q=0.8");
-    h.set("Cache-Control", "no-cache");
-    h.set("Pragma", "no-cache");
-    h.set("Referer", targetUrl.origin);
-
-    // 不要把用户的真实 Cookie / 授权头带过去
-    // 也不要带 Host（由 fetch 自动处理或我们自己指定）
-    return h;
-};
-
+// 伪装核心请求函数
 const tryCamouflage = async (req) => {
-    const urls = CONFIG.CAMOUFLAGE_URLS || [];
+    const urls = CONFIG.CAMOUFLAGE_URLS;
     if (!urls.length) return null;
 
     const ordered = pickCamouflageOrder(urls, CONFIG.CAMOUFLAGE_MODE);
-    let lastErr = null;
-
+    
     for (const raw of ordered) {
         try {
             let u = raw.trim();
@@ -217,18 +156,25 @@ const tryCamouflage = async (req) => {
             if (!u.startsWith("http://") && !u.startsWith("https://")) u = "https://" + u;
 
             const targetUrl = new URL(u);
-            const headers = buildCamouflageHeaders(req, targetUrl);
-
+            const headers = new Headers();
+            // 伪装 UA，防止 403
+            headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36");
+            headers.set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+            
             const camoRes = await fetch(targetUrl.toString(), {
-                method: "GET",               // 伪装建议固定 GET（更像“打开网页”）
-                headers,
+                method: "GET",
+                headers: headers,
                 redirect: "follow",
             });
 
-            // 复制响应（过滤一些可能导致页面不显示的头）
+            // 复制响应头，但要剔除可能导致解码错误的头
             const outHeaders = new Headers(camoRes.headers);
             outHeaders.delete("Content-Security-Policy");
             outHeaders.delete("X-Frame-Options");
+            // [关键修复]：删除压缩和长度头，因为 fetch 已经解压了 body
+            outHeaders.delete("content-encoding");
+            outHeaders.delete("content-length");
+            outHeaders.delete("transfer-encoding");
 
             const buf = await camoRes.arrayBuffer();
             return {
@@ -238,92 +184,26 @@ const tryCamouflage = async (req) => {
                 upstream: targetUrl.origin
             };
         } catch (e) {
-            lastErr = e;
+            console.error(`Camouflage failed for ${raw}:`, e.message);
+            // failover 模式会继续下一次循环
         }
     }
-
-    // 全部失败返回 null（你也可以选择返回一个“假的页面”）
     return null;
-};
-
-// ==============================================================================
-// 3. 辅助函数
-// ==============================================================================
-
-const getClientIP = (req) => {
-    const ip = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket.remoteAddress || '0.0.0.0';
-    return ip.replace(/^.*:/, ''); 
-};
-
-const getDate = () => new Date(new Date().getTime() + 28800000).toISOString().split('T')[0];
-const getTime = () => new Date(new Date().getTime() + 28800000).toISOString().replace('T', ' ').substring(0, 19);
-
-// [计费函数]：明确调用时才计费
-const chargeRequest = (ip) => {
-    if (CONFIG.IP_LIMIT_WHITELIST.includes(ip)) return;
-    try {
-        stmts.upsertLimit.run({ ip, date: getDate() });
-    } catch (e) { console.error("DB Charge Error:", e); }
-};
-
-// [日志函数]：记录详细访问日志
-const logRequest = (ip, url, status, upstream, duration, bytes, cache_hit) => {
-    try {
-        stmts.insertLog.run({
-            ip,
-            url,
-            created_at: getTime(),
-            status,
-            upstream,
-            duration,
-            bytes,
-            cache_hit: cache_hit ? 1 : 0
-        });
-    } catch (e) { console.error("DB Log Error:", e); }
-};
-
-// [HMAC] Node.js 原生实现
-const verifyHmac = (secret, message, sigHex) => {
-    try {
-        const hmac = crypto.createHmac('sha256', secret);
-        hmac.update(message);
-        const digest = hmac.digest('hex');
-        return digest === sigHex;
-    } catch (e) { return false; }
-};
-
-const generateHmac = (secret, message) => {
-    const hmac = crypto.createHmac('sha256', secret);
-    hmac.update(message);
-    return hmac.digest('hex');
 };
 
 // ==============================================================================
 // 4. 中间件
 // ==============================================================================
-
-// 速率检查 (只读，不写)
 const checkRateLimit = (req, res, next) => {
     const ip = getClientIP(req);
-    // 白名单或免费路径直接放行
     if (CONFIG.IP_LIMIT_WHITELIST.includes(ip)) return next();
     if (req.path === '/' || req.path === '/favicon.ico' || req.path === '/robots.txt') return next();
-
-    // 检查免费路径前缀
     const cleanPath = req.path.replace(/^\//, '');
-    const isFreePath = CONFIG.FREE_PATHS.some(fp => cleanPath.startsWith(fp));
-    if (isFreePath) return next();
+    if (CONFIG.FREE_PATHS.some(fp => cleanPath.startsWith(fp))) return next();
 
-    const today = getDate();
     let count = 0;
-    try {
-        const row = stmts.getLimit.get(ip, today);
-        if (row) count = row.count;
-    } catch (e) {}
-
-    if (count >= CONFIG.DAILY_LIMIT_COUNT) {
-        return res.status(429).send(`⚠️ Daily Limit Exceeded: ${count}/${CONFIG.DAILY_LIMIT_COUNT}`);
-    }
+    try { const row = stmts.getLimit.get(ip, getDate()); if (row) count = row.count; } catch (e) {}
+    if (count >= CONFIG.DAILY_LIMIT_COUNT) return res.status(429).send(`⚠️ Daily Limit Exceeded: ${count}/${CONFIG.DAILY_LIMIT_COUNT}`);
     next();
 };
 
@@ -336,23 +216,14 @@ app.use((req, res, next) => {
     next();
 });
 
-// 访问控制
 app.use((req, res, next) => {
     const ip = getClientIP(req);
-
-    // IP 白名单
-    if (CONFIG.ALLOW_IPS.length > 0 && !CONFIG.ALLOW_IPS.includes(ip)) {
-        return res.status(403).send(`Access Denied (IP ${ip} Not Allowed)`);
-    }
-
-    // GeoIP
+    if (CONFIG.ALLOW_IPS.length > 0 && !CONFIG.ALLOW_IPS.includes(ip)) return res.status(403).send(`Access Denied (IP ${ip})`);
     if (CONFIG.ALLOW_COUNTRIES.length > 0) {
-        if (ip === '127.0.0.1' || ip === 'localhost' || ip.startsWith('192.168.') || ip.startsWith('10.')) return next();
+        if (ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.')) return next();
         const geo = geoip.lookup(ip);
         const country = geo ? geo.country : "XX";
-        if (!CONFIG.ALLOW_COUNTRIES.includes(country)) {
-            return res.status(403).send(`Access Denied (Country ${country} Not Allowed)`);
-        }
+        if (!CONFIG.ALLOW_COUNTRIES.includes(country)) return res.status(403).send(`Access Denied (Country ${country})`);
     }
     next();
 });
@@ -361,7 +232,7 @@ app.use(checkRateLimit);
 app.use(express.raw({ type: '*/*', limit: '50mb' }));
 
 // ==============================================================================
-// 5. 核心路由与业务
+// 5. 核心路由
 // ==============================================================================
 
 app.get('/robots.txt', (req, res) => res.type('text/plain').send("User-agent: *\nDisallow: /"));
@@ -370,473 +241,228 @@ app.get('/favicon.ico', (req, res) => res.type('image/svg+xml').send(LIGHTNING_S
 // --- 5.1 Docker Token ---
 app.get('/token', async (req, res) => {
     const scope = req.query.scope;
-    let upstreamAuthUrl = 'https://auth.docker.io/token';
-    for (const [domain, _] of Object.entries(REGISTRY_MAP)) {
-        if (scope && scope.includes(domain)) { upstreamAuthUrl = `https://${domain}/token`; break; }
-    }
-    const newUrl = new URL(upstreamAuthUrl);
-    newUrl.search = new URLSearchParams(req.query).toString();
-    
-    if (upstreamAuthUrl === 'https://auth.docker.io/token') {
+    let upstream = 'https://auth.docker.io/token';
+    for (const [d, _] of Object.entries(REGISTRY_MAP)) if (scope && scope.includes(d)) { upstream = `https://${d}/token`; break; }
+    const newUrl = new URL(upstream); newUrl.search = new URLSearchParams(req.query).toString();
+    if (upstream === 'https://auth.docker.io/token') {
         newUrl.searchParams.set('service', 'registry.docker.io');
         if (scope && scope.startsWith('repository:')) {
             const parts = scope.split(':');
             if (parts.length >= 3 && !parts[1].includes('/') && !Object.keys(REGISTRY_MAP).some(d => parts[1].startsWith(d))) {
-                parts[1] = 'library/' + parts[1];
-                newUrl.searchParams.set('scope', parts.join(':'));
+                parts[1] = 'library/' + parts[1]; newUrl.searchParams.set('scope', parts.join(':'));
             }
         }
     }
-
     try {
-        const upstreamRes = await fetch(newUrl, { headers: { 'User-Agent': 'Docker-Client/24.0.5 (linux)', 'Host': newUrl.hostname } });
-        res.status(upstreamRes.status);
-        upstreamRes.headers.forEach((v, k) => res.setHeader(k, v));
-        const data = await upstreamRes.arrayBuffer();
-        res.send(Buffer.from(data));
-        // Token 请求通常不计费，也不记录详细日志
+        const resp = await fetch(newUrl, { headers: { 'User-Agent': 'Docker-Client/24.0.5 (linux)', 'Host': newUrl.hostname } });
+        res.status(resp.status); resp.headers.forEach((v, k) => res.setHeader(k, v));
+        res.send(Buffer.from(await resp.arrayBuffer()));
     } catch (e) { res.status(500).send(e.message); }
 });
 
 // --- 5.2 Docker V2 API ---
 app.use('/v2', async (req, res) => {
-    const startTime = Date.now();
-    const clientIP = getClientIP(req);
+    const start = Date.now(); const ip = getClientIP(req);
+    if (req.path !== '/' && req.path !== '') chargeRequest(ip);
     
-    // 计费与日志变量
-    let finalUpstream = "DockerV2";
-    let isCacheHit = false;
-    let bytes = 0;
-
-    // 执行扣费 (非根路径)
-    if (req.path !== '/' && req.path !== '') {
-        chargeRequest(clientIP);
-    }
-
     let path = req.path === '/' ? '' : req.path;
-    let targetDomain = 'registry-1.docker.io'; 
-    let upstream = 'https://registry-1.docker.io';
+    let domain = 'registry-1.docker.io'; let upstream = 'https://registry-1.docker.io';
 
-    // 根路径检查
     if (path === '') {
         try {
-            const rootReq = await fetch('https://registry-1.docker.io/v2/', { method: req.method, headers: req.headers });
-            if (rootReq.status === 401) {
-                const wwwAuth = rootReq.headers.get('WWW-Authenticate');
-                if (wwwAuth) {
-                    const workerOrigin = `${req.protocol}://${req.get('host')}`;
-                    res.setHeader('WWW-Authenticate', wwwAuth.replace(/realm="([^"]+)"/, `realm="${workerOrigin}/token"`));
-                }
-                return res.status(401).send(await rootReq.text());
+            const r = await fetch(upstream + '/v2/', { method: req.method, headers: req.headers });
+            if (r.status === 401) {
+                const auth = r.headers.get('WWW-Authenticate');
+                if (auth) res.setHeader('WWW-Authenticate', auth.replace(/realm="([^"]+)"/, `realm="${req.protocol}://${req.get('host')}/token"`));
+                return res.status(401).send(await r.text());
             }
-            return res.status(rootReq.status).send(await rootReq.text());
-        } catch (e) { return res.status(500).send(e.message); }
+            return res.status(r.status).send(await r.text());
+        } catch(e) { return res.status(500).send(e.message); }
     }
 
-    const pathParts = path.replace(/^\//, '').split('/');
-    if (REGISTRY_MAP[pathParts[0]]) {
-        targetDomain = pathParts[0]; upstream = REGISTRY_MAP[pathParts[0]]; path = '/' + pathParts.slice(1).join('/');
-    } else if (targetDomain === 'registry-1.docker.io') {
-        const p0 = pathParts[0];
-        if (pathParts.length > 1 && !p0.includes('.') && p0 !== 'manifests' && p0 !== 'blobs' && p0 !== 'tags' && !p0.startsWith('sha256:')) {
-            if (p0 !== 'library') { if (pathParts[1] === 'manifests' || pathParts[1] === 'blobs' || pathParts[1] === 'tags') path = '/library' + path; }
+    const parts = path.replace(/^\//, '').split('/');
+    if (REGISTRY_MAP[parts[0]]) { domain = parts[0]; upstream = REGISTRY_MAP[parts[0]]; path = '/' + parts.slice(1).join('/'); }
+    else if (domain === 'registry-1.docker.io') {
+        const p0 = parts[0];
+        if (parts.length > 1 && !p0.includes('.') && !['manifests','blobs','tags'].includes(p0) && !p0.startsWith('sha256:')) {
+            if (p0 !== 'library') { if(['manifests','blobs','tags'].includes(parts[1])) path = '/library' + path; }
         }
     }
 
-    finalUpstream = targetDomain;
     const targetUrl = `${upstream}/v2${path}`;
-    const headers = { ...req.headers };
-    headers['Host'] = targetDomain; headers['User-Agent'] = 'Docker-Client/24.0.5 (linux)';
+    const headers = { ...req.headers }; headers['Host'] = domain; headers['User-Agent'] = 'Docker-Client/24.0.5 (linux)';
     delete headers['host']; delete headers['connection'];
 
     try {
-        const response = await fetch(targetUrl, { method: req.method, headers: headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body, redirect: 'manual' });
-        
-        if (response.status === 401) {
-            const wwwAuth = response.headers.get('WWW-Authenticate');
-            if (wwwAuth) {
-                const workerOrigin = `${req.protocol}://${req.get('host')}`;
-                res.setHeader('WWW-Authenticate', wwwAuth.replace(/realm="([^"]+)"/, `realm="${workerOrigin}/token"`));
-            }
-            res.status(401);
-            const body = await response.text();
-            res.send(body);
-            logRequest(clientIP, req.originalUrl, 401, finalUpstream, Date.now() - startTime, body.length, false);
-            return;
+        const resp = await fetch(targetUrl, { method: req.method, headers: headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body, redirect: 'manual' });
+        if (resp.status === 401) {
+            const auth = resp.headers.get('WWW-Authenticate');
+            if (auth) res.setHeader('WWW-Authenticate', auth.replace(/realm="([^"]+)"/, `realm="${req.protocol}://${req.get('host')}/token"`));
+            res.status(401); const body = await resp.text(); res.send(body);
+            logRequest(ip, req.originalUrl, 401, domain, Date.now() - start, body.length, false); return;
         }
-
-        if ([301, 302, 303, 307, 308].includes(response.status)) {
-            const location = response.headers.get('Location');
-            if (location) {
-                const blobResp = await fetch(location, { method: 'GET', headers: { 'User-Agent': 'Docker-Client/24.0.5 (linux)' } });
-                res.status(blobResp.status);
-                blobResp.headers.forEach((v, k) => { if (k !== 'content-encoding' && k !== 'transfer-encoding') res.setHeader(k, v); });
-                const buf = await blobResp.arrayBuffer();
-                res.send(Buffer.from(buf));
-                logRequest(clientIP, req.originalUrl, blobResp.status, "BlobS3", Date.now() - startTime, buf.byteLength, false);
-                return;
-            }
+        if ([301, 302, 307, 308].includes(resp.status) && resp.headers.get('Location')) {
+            const blob = await fetch(resp.headers.get('Location'), { method: 'GET', headers: { 'User-Agent': 'Docker-Client/24.0.5 (linux)' } });
+            res.status(blob.status); blob.headers.forEach((v, k) => { if(k!=='content-encoding' && k!=='transfer-encoding') res.setHeader(k, v); });
+            const buf = await blob.arrayBuffer(); res.send(Buffer.from(buf));
+            logRequest(ip, req.originalUrl, blob.status, "BlobS3", Date.now() - start, buf.byteLength, false); return;
         }
-
-        res.status(response.status);
-        response.headers.forEach((v, k) => res.setHeader(k, v));
-        const buf = await response.arrayBuffer();
-        res.send(Buffer.from(buf));
-        logRequest(clientIP, req.originalUrl, response.status, finalUpstream, Date.now() - startTime, buf.byteLength, false);
-
-    } catch (e) {
-        res.status(502).send(`Docker Proxy Error: ${e.message}`);
-        logRequest(clientIP, req.originalUrl, 502, finalUpstream, Date.now() - startTime, 0, false);
+        res.status(resp.status); resp.headers.forEach((v, k) => res.setHeader(k, v));
+        const buf = await resp.arrayBuffer(); res.send(Buffer.from(buf));
+        logRequest(ip, req.originalUrl, resp.status, domain, Date.now() - start, buf.byteLength, false);
+    } catch(e) { 
+        res.status(502).send(e.message); 
+        logRequest(ip, req.originalUrl, 502, domain, Date.now() - start, 0, false);
     }
 });
 
-// --- 5.3 通用代理入口 (核心逻辑) ---
+// --- 5.3 通用入口 ---
 app.all('*', async (req, res) => {
-    const startTime = Date.now();
-    const clientIP = getClientIP(req);
-    const referer = req.headers['referer'] || "";
-    const userAgent = req.headers['user-agent'] || "";
-    const path = req.path;
-
-    // --- 认证判断 ---
-    const isAdminIp = CONFIG.ADMIN_IPS.includes(clientIP);
-    const isWhitelisted = CONFIG.IP_LIMIT_WHITELIST.includes(clientIP);
-
-    // 1. Referer 免密
-    let isTrustedReferer = false;
-    if (CONFIG.ALLOW_REFERER && referer) {
-        const rules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s => s.trim()).filter(s => s);
-        for (const rule of rules) {
-            if (rule.includes("://") ? referer.startsWith(rule) : (function(){ try { return new URL(referer).hostname.endsWith(rule); } catch(e) { return referer.includes(rule); } })()) {
-                isTrustedReferer = true; break;
-            }
-        }
-    }
-
-    // 2. UA 免密
-    let isTrustedUA = false;
-    if (CONFIG.ALLOW_USER_AGENT && userAgent.includes(CONFIG.ALLOW_USER_AGENT)) {
-        isTrustedUA = true;
-    }
-
-    // 3. HMAC 签名链接解析
-    let isHmacVerified = false;
-    let subPath = "";
+    const start = Date.now(); const ip = getClientIP(req); const path = req.path;
+    const isAdmin = CONFIG.ADMIN_IPS.includes(ip);
     
-    // HMAC 格式: /s/<exp>/<sig>/<target>
+    // 认证逻辑
+    let isTrusted = isAdmin || CONFIG.IP_LIMIT_WHITELIST.includes(ip);
+    if (!isTrusted && CONFIG.ALLOW_REFERER) {
+        const ref = req.headers['referer'] || "";
+        const rules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s=>s.trim()).filter(s=>s);
+        for(const r of rules) if(r.includes("://") ? ref.startsWith(r) : ref.includes(r)) { isTrusted = true; break; }
+    }
+    if (!isTrusted && CONFIG.ALLOW_USER_AGENT && (req.headers['user-agent']||"").includes(CONFIG.ALLOW_USER_AGENT)) isTrusted = true;
+
+    let subPath = "", isAuth = false, isHmac = false;
     if (path.startsWith('/s/')) {
         const parts = path.split('/');
-        if (parts.length >= 5) {
-            const exp = parts[2];
-            const sig = parts[3];
-            const target = parts.slice(4).join('/');
-            
-            const now = Math.floor(Date.now() / 1000);
-            if (parseInt(exp) > now) {
-                // 验证签名
-                if (verifyHmac(CONFIG.SIGN_SECRET, `${exp}\n${target}`, sig)) {
-                    isHmacVerified = true;
-                    subPath = target;
-                }
-            }
+        if (parts.length >= 5 && verifyHmac(CONFIG.SIGN_SECRET, `${parts[2]}\n${parts.slice(4).join('/')}`, parts[3]) && parseInt(parts[2]) > Date.now()/1000) {
+            isAuth = true; subPath = parts.slice(4).join('/'); isHmac = true; isTrusted = true;
         }
-    }
-
-    const isTrusted = isAdminIp || isWhitelisted || isTrustedReferer || isTrustedUA || isHmacVerified;
-    let isAuthenticated = false;
-
-    // --- 路径解析与认证 ---
-    if (isHmacVerified) {
-        // HMAC 已经解析出 subPath
-        isAuthenticated = true;
     } else {
         const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
-        if (match && match[1] === CONFIG.PASSWORD) {
-            isAuthenticated = true;
-            subPath = match[2] || ""; 
-        } else if (isTrusted) {
-            isAuthenticated = true;
-            subPath = path.substring(1); 
-        }
+        if (match && match[1] === CONFIG.PASSWORD) { isAuth = true; subPath = match[2] || ""; }
+        else if (isTrusted) { isAuth = true; subPath = path.substring(1); }
     }
 
-    // 未认证 -> 伪装或 404
-    if (!isAuthenticated) {
-    const camo = await tryCamouflage(req);
-    if (camo) {
-        res.status(camo.status);
-        camo.headers.forEach((v, k) => res.setHeader(k, v));
-        // 可选：加个极低存在感的 header（不建议太显眼）
-        // res.setHeader('X-Powered-By', 'nginx');
-        res.send(camo.body);
-        return;
-    }
-    return res.status(404).send("404 Not Found - Powered by ProxyX");
-}
-
-    // --- 管理员 API (不扣费，不记录普通日志) ---
-    // [权限控制] 仅 Admin IP 可操作，Referer 免密无权操作
-    if (subPath === "reset") {
-        if (!isAdminIp) return res.status(403).send("Forbidden");
-        stmts.resetIp.run(clientIP, getDate());
-        return res.json({ status: "success" });
-    }
-    if (subPath === "reset-all") {
-        if (!isAdminIp) return res.status(403).send("Forbidden");
-        stmts.resetAllLimits.run();
-        return res.json({ status: "success" });
-    }
-    if (subPath === "stats") {
-        if (!isAdminIp) return res.status(403).send("Forbidden");
-        const rows = stmts.getStats.all(getDate());
-        const stats = rows.map(r => ({ ip: r.ip, count: r.count }));
-        const total = stats.reduce((acc, c) => acc + c.count, 0);
-        return res.json({ status: "success", data: { totalRequests: total, uniqueIps: stats.length, details: stats } });
-    }
-    // [新增] 日志查询 API
-    if (subPath === "logs") {
-        if (!isAdminIp) return res.status(403).send("Forbidden");
-        const logs = stmts.getLogs.all();
-        return res.json({ status: "success", data: logs });
-    }
-    // [新增] 日志删除 API
-    if (subPath === "delete-logs") {
-        if (!isAdminIp) return res.status(403).send("Forbidden");
-        const body = await new Promise(resolve => {
-            let data = '';
-            req.on('data', chunk => data += chunk);
-            req.on('end', () => resolve(JSON.parse(data || '{}')));
-        });
-        
-        if (body.ids && Array.isArray(body.ids)) {
-            // 安全起见，转为 int 并过滤
-            const ids = body.ids.map(i => parseInt(i)).filter(i => !isNaN(i)).join(',');
-            if (ids) db.prepare(`DELETE FROM access_logs WHERE id IN (${ids})`).run();
-        } else if (body.days) {
-            stmts.deleteLogsByDate.run(body.days);
-        } else {
-            stmts.resetAllLogs.run();
+    // [修改] 未认证处理 -> 伪装逻辑
+    if (!isAuth) {
+        const camo = await tryCamouflage(req);
+        if (camo) {
+            res.status(camo.status);
+            camo.headers.forEach((v, k) => res.setHeader(k, v));
+            res.send(camo.body);
+            logRequest(ip, req.originalUrl, camo.status, camo.upstream, Date.now() - start, camo.body.length, false);
+            return;
         }
-        return res.json({ status: "success" });
+        return res.status(404).send("404 Not Found - Powered by ProxyX");
     }
-    // [新增] 签名链接生成 API
+
+    // Admin API
+    if (subPath === "reset") { if(!isAdmin) return res.status(403).send("Forbidden"); stmts.resetIp.run(ip, getDate()); return res.json({status:"success"}); }
+    if (subPath === "reset-all") { if(!isAdmin) return res.status(403).send("Forbidden"); stmts.resetAllLimits.run(); return res.json({status:"success"}); }
+    if (subPath === "stats") { if(!isAdmin) return res.status(403).send("Forbidden"); const rows = stmts.getStats.all(getDate()); return res.json({status:"success", data:{totalRequests:rows.reduce((a,c)=>a+c.count,0), uniqueIps:rows.length, details:rows}}); }
+    if (subPath === "logs") { if(!isAdmin) return res.status(403).send("Forbidden"); return res.json({status:"success", data:stmts.getLogs.all()}); }
+    if (subPath === "delete-logs") { 
+        if(!isAdmin) return res.status(403).send("Forbidden"); 
+        const body = await new Promise(r=>{let d='';req.on('data',c=>d+=c);req.on('end',()=>r(JSON.parse(d||'{}')))});
+        if(body.ids) { const ids = body.ids.map(i=>parseInt(i)).filter(i=>!isNaN(i)).join(','); if(ids) db.prepare(`DELETE FROM access_logs WHERE id IN (${ids})`).run(); }
+        else if(body.days) stmts.deleteLogsByDate.run(body.days);
+        else stmts.resetAllLogs.run();
+        return res.json({status:"success"});
+    }
     if (subPath === "sign-url") {
-        if (!isAdminIp) return res.status(403).send("Forbidden");
-        const body = await new Promise(resolve => {
-            let data = '';
-            req.on('data', chunk => data += chunk);
-            req.on('end', () => resolve(JSON.parse(data || '{}')));
-        });
-        
-        const target = body.target;
-        const seconds = parseInt(body.seconds) || 3600;
-        const exp = Math.floor(Date.now() / 1000) + seconds;
-        const sig = generateHmac(CONFIG.SIGN_SECRET, `${exp}\n${target}`);
-        return res.json({ status: "success", url: `/s/${exp}/${sig}/${target}` });
+        if(!isAdmin) return res.status(403).send("Forbidden");
+        const body = await new Promise(r=>{let d='';req.on('data',c=>d+=c);req.on('end',()=>r(JSON.parse(d||'{}')))});
+        const exp = Math.floor(Date.now()/1000) + (parseInt(body.seconds)||3600);
+        const sig = generateHmac(CONFIG.SIGN_SECRET, `${exp}\n${body.target}`);
+        return res.json({status:"success", url:`/s/${exp}/${sig}/${body.target}`});
     }
 
-    // --- 仪表盘 (不扣费) ---
+    // Dashboard (不扣费)
     if (!subPath) {
-        let count = 0;
-        try {
-            const row = stmts.getLimit.get(clientIP, getDate());
-            if (row) count = row.count;
-        } catch(e) {}
-        return res.send(renderDashboard(req.hostname, CONFIG.PASSWORD, clientIP, count, CONFIG.DAILY_LIMIT_COUNT, CONFIG.ADMIN_IPS));
+        let count = 0; try { const r = stmts.getLimit.get(ip, getDate()); if(r) count=r.count; } catch(e){}
+        return res.send(renderDashboard(req.hostname, CONFIG.PASSWORD, ip, count, CONFIG.DAILY_LIMIT_COUNT, CONFIG.ADMIN_IPS));
     }
 
-    // ============================================
-    // 🚀 核心代理逻辑 (执行扣费 & 日志)
-    // ============================================
-    
-    let finalUpstream = "";
-    let isCacheHit = false;
-    let responseBytes = 0;
+    // Proxy Logic
+    let finalUpstream = "", bytes = 0, isCache = false;
+    const cleanSub = subPath.replace(/^\//,'');
+    const isFree = CONFIG.FREE_PATHS.some(fp => cleanSub.startsWith(fp));
+    if (!isFree) chargeRequest(ip);
 
-    // 检查是否免费路径
-    const cleanSubPath = subPath.replace(/^\//, '');
-    const isFree = CONFIG.FREE_PATHS.some(fp => cleanSubPath.startsWith(fp));
-
-    // 执行扣费 (如果不是免费路径)
-    if (!isFree) {
-        chargeRequest(clientIP);
-    }
-
-    // --- Linux 源加速 ---
-    const sortedMirrors = Object.keys(LINUX_MIRRORS).sort((a, b) => b.length - a.length);
-    const linuxDistro = sortedMirrors.find(k => subPath.startsWith(k + '/') || subPath === k);
-
+    // Linux
+    const linuxDistro = Object.keys(LINUX_MIRRORS).sort((a,b)=>b.length-a.length).find(k => subPath.startsWith(k+'/') || subPath === k);
     if (linuxDistro) {
-        const realPath = subPath.replace(linuxDistro, '').replace(/^\//, '');
-        const upstreamBase = LINUX_MIRRORS[linuxDistro];
-        const targetUrl = upstreamBase.endsWith('/') ? upstreamBase + realPath : upstreamBase + '/' + realPath;
-        finalUpstream = upstreamBase;
-        
+        const up = LINUX_MIRRORS[linuxDistro]; finalUpstream = up;
+        const target = up.endsWith('/') ? up + subPath.replace(linuxDistro,'').replace(/^\//,'') : up + '/' + subPath.replace(linuxDistro,'').replace(/^\//,'');
         try {
-            const headers = { ...req.headers }; delete headers['host'];
-            const linuxRes = await fetch(targetUrl, { method: req.method, headers: headers, redirect: 'follow' });
-            
-            res.status(linuxRes.status);
-            linuxRes.headers.forEach((v, k) => res.setHeader(k, v));
-            const buf = await linuxRes.arrayBuffer();
-            responseBytes = buf.byteLength;
+            const headers = {...req.headers}; delete headers['host'];
+            const r = await fetch(target, { method: req.method, headers: headers, redirect: 'follow' });
+            res.status(r.status); r.headers.forEach((v,k)=>res.setHeader(k,v));
+            const buf = await r.arrayBuffer(); bytes = buf.byteLength;
             res.send(Buffer.from(buf));
-            
-            logRequest(clientIP, req.originalUrl, linuxRes.status, finalUpstream, Date.now() - startTime, responseBytes, false);
+            logRequest(ip, req.originalUrl, r.status, up, Date.now()-start, bytes, false);
             return;
-        } catch (e) {
-            res.status(502).send(`Linux Mirror Error: ${e.message}`);
-            logRequest(clientIP, req.originalUrl, 502, finalUpstream, Date.now() - startTime, 0, false);
-            return;
-        }
+        } catch(e) { res.status(502).send(e.message); logRequest(ip, req.originalUrl, 502, up, Date.now()-start, 0, false); return; }
     }
 
-    // --- 通用文件/递归加速 ---
-    let proxyMode = 'raw';
-    let targetUrlStr = subPath;
+    // General Proxy
+    let mode = 'raw'; let targetStr = subPath;
+    if (subPath.startsWith('rt/') || subPath === 'rt') { mode = 'recursive_text'; targetStr = subPath.replace(/^rt\/?/, ""); }
+    else if (subPath.startsWith('r/') || subPath === 'r') { mode = 'recursive_all'; targetStr = subPath.replace(/^r\/?/, ""); }
+    
+    if (!targetStr.startsWith("http")) targetStr = 'https://' + targetStr;
+    else targetStr = targetStr.replace(/^(https?):\/+(?!\/)/, '$1://');
 
-    if (subPath.startsWith('rt/') || subPath === 'rt') {
-        proxyMode = 'recursive_text';
-        targetUrlStr = subPath.replace(/^rt\/?/, "");
-    } else if (subPath.startsWith('r/') || subPath === 'r') {
-        proxyMode = 'recursive_all';
-        targetUrlStr = subPath.replace(/^r\/?/, "");
-    }
-
-    if (!targetUrlStr.startsWith("http")) {
-        targetUrlStr = 'https://' + targetUrlStr;
-    } else {
-        targetUrlStr = targetUrlStr.replace(/^(https?):\/+(?!\/)/, '$1://');
-    }
-
-    // 安全检查
     try {
-        const parsedUrl = new URL(targetUrlStr);
-        const domain = parsedUrl.hostname;
-        finalUpstream = domain;
-        if (CONFIG.BLACKLIST.length > 0 && CONFIG.BLACKLIST.some(k => domain.includes(k))) return res.status(403).send("Blocked Domain");
-        if (CONFIG.WHITELIST.length > 0 && !CONFIG.WHITELIST.some(k => domain.includes(k))) return res.status(403).send("Blocked (Not Whitelisted)");
-    } catch (e) { return res.status(400).send(`Invalid URL: ${targetUrlStr}`); }
+        const u = new URL(targetStr); finalUpstream = u.hostname;
+        if (CONFIG.BLACKLIST.some(k => u.hostname.includes(k))) return res.status(403).send("Blocked Domain");
+        if (CONFIG.WHITELIST.length > 0 && !CONFIG.WHITELIST.some(k => u.hostname.includes(k))) return res.status(403).send("Blocked");
+    } catch(e) { return res.status(400).send("Invalid URL"); }
 
     const cacheKey = req.originalUrl;
-    
-    // 缓存命中逻辑
-    if ((proxyMode === 'recursive_all' || proxyMode === 'recursive_text') && CONFIG.ENABLE_CACHE) {
-        const cachedBody = myCache.get(cacheKey);
-        if (cachedBody) {
-            res.setHeader('X-Cache-Status', 'HIT');
-            res.setHeader('X-Proxy-Mode', 'Recursive-Cached');
-            res.send(cachedBody);
-            logRequest(clientIP, req.originalUrl, 200, finalUpstream, Date.now() - startTime, cachedBody.length, true);
-            return;
+    if ((mode!=='raw') && CONFIG.ENABLE_CACHE) {
+        const cached = myCache.get(cacheKey);
+        if(cached) { 
+            res.setHeader('X-Cache-Status', 'HIT'); res.send(cached); 
+            logRequest(ip, req.originalUrl, 200, finalUpstream, Date.now()-start, cached.length, true); return; 
         }
     }
 
-    // 发起请求
     try {
-        const headers = { ...req.headers }; delete headers['host']; delete headers['connection'];
-        if (!headers['user-agent']) headers['user-agent'] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
-
-        const upstreamRes = await fetch(targetUrlStr, {
-            method: req.method,
-            headers: headers,
-            body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
-            redirect: 'follow' 
-        });
-
-        res.status(upstreamRes.status);
-        upstreamRes.headers.forEach((v, k) => {
-            if ((proxyMode === 'recursive_all' || proxyMode === 'recursive_text') && (k === 'content-encoding' || k === 'content-length' || k === 'transfer-encoding')) return;
-            res.setHeader(k, v);
-        });
+        const headers = {...req.headers}; delete headers['host']; delete headers['connection'];
+        if (!headers['user-agent']) headers['user-agent'] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36";
+        const r = await fetch(targetStr, { method: req.method, headers: headers, body: ['GET','HEAD'].includes(req.method)?undefined:req.body, redirect: 'follow' });
         
-        // Admin Debug Header
-        if (isAdminIp) {
-            res.setHeader('X-Debug-Upstream', finalUpstream);
-            res.setHeader('X-Debug-Duration', (Date.now() - startTime) + 'ms');
-        }
+        res.status(r.status);
+        r.headers.forEach((v,k) => { if((mode!=='raw') && ['content-encoding','content-length','transfer-encoding'].includes(k)) return; res.setHeader(k,v); });
+        if(isAdmin) { res.setHeader('X-Debug-Upstream', finalUpstream); res.setHeader('X-Debug-Duration', (Date.now()-start)+'ms'); }
 
-        // A. Raw Mode
-        if (proxyMode === 'raw') {
-            const buf = await upstreamRes.arrayBuffer();
-            responseBytes = buf.byteLength;
+        if (mode === 'raw') {
+            const buf = await r.arrayBuffer(); bytes = buf.byteLength;
             res.send(Buffer.from(buf));
-            logRequest(clientIP, req.originalUrl, upstreamRes.status, finalUpstream, Date.now() - startTime, responseBytes, false);
-            return;
-        }
-
-        // B. Recursive Mode
-        // B1. Recursive All (强制重写)
-        if (proxyMode === 'recursive_all') {
-            let text = await upstreamRes.text();
-            const workerOrigin = `${req.protocol}://${req.get('host')}`;
-            // 保持前缀一致性：如果是 HMAC 进来的，保持 HMAC 逻辑太复杂，简化为使用标准 r/
-            // 这里为了简单，递归链接统一回退到使用密码或免密路径
-            const prefixPath = (isTrusted && !path.startsWith('/' + CONFIG.PASSWORD)) ? '' : `/${CONFIG.PASSWORD}`;
-            const proxyBase = `${workerOrigin}${prefixPath}/r/`;
-
-            const regex = /(https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))/g;
-            text = text.replace(regex, (match) => {
-                if (match.includes(workerOrigin)) return match; 
-                return proxyBase + match;
-            });
-            
-            responseBytes = Buffer.byteLength(text);
-            if (CONFIG.ENABLE_CACHE && upstreamRes.status === 200) myCache.set(cacheKey, text);
-            res.send(text);
-            logRequest(clientIP, req.originalUrl, upstreamRes.status, finalUpstream, Date.now() - startTime, responseBytes, false);
-            return;
-        }
-
-        // B2. Recursive Text (智能重写)
-        if (proxyMode === 'recursive_text') {
-            const cType = (upstreamRes.headers.get("content-type") || "").toLowerCase();
-            const isText = cType.includes("text/") || cType.includes("javascript") || cType.includes("json") || cType.includes("xml");
-            
-            if (!isText) {
-                // Fallback to raw
-                const buf = await upstreamRes.arrayBuffer();
-                res.send(Buffer.from(buf));
-                logRequest(clientIP, req.originalUrl, upstreamRes.status, finalUpstream, Date.now() - startTime, buf.byteLength, false);
-                return;
+        } else {
+            let text = await r.text();
+            if (mode === 'recursive_text' && !((r.headers.get("content-type")||"").includes("text/") || (r.headers.get("content-type")||"").includes("json"))) {
+                res.send(text); // fallback raw text
+            } else {
+                const origin = `${req.protocol}://${req.get('host')}`;
+                const base = `${origin}/${CONFIG.PASSWORD}/${mode === 'rt' ? 'rt' : 'r'}/`;
+                text = text.replace(/(https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))/g, m => m.includes(origin) ? m : base + m);
+                if (mode === 'recursive_text' && (r.headers.get("content-type")||"").includes("html")) {
+                    text = text.replace(/(href|src|action)=["'](\/[^"']+)["']/g, (m,a,p) => `${a}="${base}${new URL(targetStr).origin}${p}"`);
+                }
+                bytes = Buffer.byteLength(text);
+                if(CONFIG.ENABLE_CACHE && r.status===200) myCache.set(cacheKey, text);
+                res.send(text);
             }
-
-            let text = await upstreamRes.text();
-            const workerOrigin = `${req.protocol}://${req.get('host')}`;
-            const prefixPath = (isTrusted && !path.startsWith('/' + CONFIG.PASSWORD)) ? '' : `/${CONFIG.PASSWORD}`;
-            const proxyBase = `${workerOrigin}${prefixPath}/rt/`;
-
-            const regex = /(https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))/g;
-            text = text.replace(regex, (match) => {
-                if (match.includes(workerOrigin)) return match; 
-                return proxyBase + match;
-            });
-
-            // HTML 相对路径修正
-            if (cType.includes("html")) {
-                 const currentBase = new URL(targetUrlStr).origin;
-                 const rootRelRegex = /(href|src|action)=["'](\/[^"']+)["']/g;
-                 text = text.replace(rootRelRegex, (match, attr, path) => {
-                     return `${attr}="${proxyBase}${currentBase}${path}"`;
-                 });
-            }
-
-            responseBytes = Buffer.byteLength(text);
-            if (CONFIG.ENABLE_CACHE && upstreamRes.status === 200) myCache.set(cacheKey, text);
-            res.send(text);
-            logRequest(clientIP, req.originalUrl, upstreamRes.status, finalUpstream, Date.now() - startTime, responseBytes, false);
         }
-
-    } catch (e) {
-        res.status(502).send(`General Proxy Error: ${e.message}`);
-        logRequest(clientIP, req.originalUrl, 502, finalUpstream, Date.now() - startTime, 0, false);
+        logRequest(ip, req.originalUrl, r.status, finalUpstream, Date.now()-start, bytes, false);
+    } catch(e) { 
+        res.status(502).send(e.message); 
+        logRequest(ip, req.originalUrl, 502, finalUpstream, Date.now()-start, 0, false); 
     }
 });
 
-// 启动监听
-app.listen(PORT, () => {
-    console.log(`ProxyX Server running on port ${PORT}`);
-});
+app.listen(PORT, () => { console.log(`ProxyX Server running on port ${PORT}`); });
 
 // ==============================================================================
 // 4. Dashboard 渲染 (UI 界面 - 独立 UI 部分 - 自定义时间增强版 - 双语版)
