@@ -44,3 +44,9 @@ services:
       # 注意：127.0.0.1 仅在 host 模式下代表本机，建议添加你的公网 IP
       - ADMIN_IPS=127.0.0.1         # 管理员 IP (拥有重置额度、查看全站统计的权限)
       - IP_LIMIT_WHITELIST=127.0.0.1 # 免额度限制的 IP 白名单 (这些 IP 不扣费)
+      # --- 免密访问 / 高级配置 ---
+      - ALLOW_REFERER=github.com,nodeseek.com # 允许的引用来源 (免密访问)
+      - SIGN_SECRET=change-me-to-a-secure-random-string # HMAC 签名密钥 (务必修改此值以确保安全)
+      - ALLOW_USER_AGENT=            # 允许免密访问的 User-Agent
+      - FREE_PATHS=ubuntu,debian,centos,rockylinux,almalinux,fedora,alpine,kali,termux  # 免费路径列表
+      - CAMOUFLAGE_URL=blog.spacenb.com,blog.2055555.xyz        # 伪装域名
