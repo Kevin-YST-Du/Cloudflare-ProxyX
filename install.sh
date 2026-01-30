@@ -7,7 +7,7 @@ INSTALL_DIR="/opt/proxyx"
 # ===========================================
 
 # --- 1. 基础信息获取 ---
-echo "🚀 开始安装 VPS 代理服务 (Node.js 源码版 v5.0)..."
+echo "🚀 开始安装 VPS 代理服务 (Node.js 源码版 v5.0+)..."
 echo "--------------------------------"
 
 read -p "请设置服务端口 [默认 $DEFAULT_PORT]: " input_port
@@ -99,6 +99,7 @@ VAR_SIGN_SECRET="change-me-to-a-secure-random-string"
 VAR_ALLOW_USER_AGENT=""
 VAR_FREE_PATHS="ubuntu,debian,centos,rockylinux,almalinux,fedora,alpine,kali,termux"
 VAR_CAMOUFLAGE_URL=""
+VAR_CAMOUFLAGE_MODE="random" # 新增默认值
 
 if [ "$config_choice" == "2" ]; then
     echo -e "\n--- 进入高级配置模式 (直接回车保持默认值) ---"
@@ -154,8 +155,16 @@ if [ "$config_choice" == "2" ]; then
     read -p "免费路径列表 (不消耗额度) [默认 Linux 源]: " input_free
     VAR_FREE_PATHS=${input_free:-"ubuntu,debian,centos,rockylinux,almalinux,fedora,alpine,kali,termux"}
 
-    read -p "伪装域名 (未授权访问时跳转) [默认为空]: " input_camo
+    read -p "伪装域名 (未授权访问时跳转, 多个用逗号分隔) [默认为空]: " input_camo
     VAR_CAMOUFLAGE_URL=${input_camo:-""}
+
+    if [ -n "$VAR_CAMOUFLAGE_URL" ]; then
+        echo "伪装策略:"
+        echo "  random: 每次随机选择一个伪装地址"
+        echo "  failover: 按顺序尝试，失败则尝试下一个"
+        read -p "请选择模式 [random/failover, 默认 random]: " input_mode
+        VAR_CAMOUFLAGE_MODE=${input_mode:-"random"}
+    fi
     
     echo "--------------------------------"
 fi
@@ -186,10 +195,11 @@ SIGN_SECRET=$VAR_SIGN_SECRET            # HMAC 签名密钥 (务必修改此值�
 ALLOW_USER_AGENT=$VAR_ALLOW_USER_AGENT       # 允许免密访问的 User-Agent
 FREE_PATHS=$VAR_FREE_PATHS          # 免费路径列表 (不消耗额度)
 CAMOUFLAGE_URL=$VAR_CAMOUFLAGE_URL         # 伪装域名 (未授权访问时跳转)
+CAMOUFLAGE_MODE=$VAR_CAMOUFLAGE_MODE       # 伪装策略: random(随机) / failover(故障转移)
 EOF
 
 # --- 5. 安装依赖 ---
-echo "📦 安装 NPM 依赖..."
+echo "📦 安装 NPM 依赖 (包括编译 SQLite)..."
 # 这一步会自动编译 better-sqlite3，可能需要几分钟
 npm install --production
 
