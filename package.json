@@ -1,6 +1,6 @@
 {
   "name": "proxyx",
-  "version": "4.9.0",
+  "version": "5.0.0",
   "description": "Ultimate Docker & Linux Recursive Proxy Server with GeoIP & SQLite Persistence",
   "main": "src/server.js",
   "bin": "src/server.js",
