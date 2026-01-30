@@ -179,6 +179,10 @@ export default {
         const userAgent = (request.headers.get("User-Agent") || "").toLowerCase();
         const referer = request.headers.get("Referer") || "";
 
+        // ✅ 新增：自动懒建表（确保后面任何 D1 读写都不会因为表不存在而报错）
+        // 说明：这里用 await 是为了“首个请求就可用”，不然 waitUntil 可能首个请求仍然报表不存在
+        await ensureD1Schema(env);
+
         const cleanPath = url.pathname.replace(/^\//, '');
         const isFreePath = CONFIG.FREE_PATHS.some(fp => cleanPath.startsWith(fp));
 
@@ -541,6 +545,55 @@ export default {
         return response;
     }
 };
+
+// ==============================================================================
+// 3.x D1 懒建表（自动执行一次，不再需要你手动跑 CREATE TABLE）
+// ==============================================================================
+
+// ✅ 同一个 Worker isolate 内只会做一次（冷启动后会再做一次也没事，IF NOT EXISTS 是幂等的）
+let __D1_SCHEMA_READY = false;
+let __D1_SCHEMA_PROMISE = null;
+
+async function ensureD1Schema(env) {
+    if (!env || !env.DB) return;               // 没绑定 D1 就跳过
+    if (__D1_SCHEMA_READY) return;             // 已经初始化过
+    if (__D1_SCHEMA_PROMISE) return __D1_SCHEMA_PROMISE; // 避免并发重复建表
+
+    __D1_SCHEMA_PROMISE = (async () => {
+        const stmts = [
+            `CREATE TABLE IF NOT EXISTS access_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ip TEXT,
+                url TEXT,
+                created_at TEXT,
+                status INTEGER,
+                upstream TEXT,
+                duration INTEGER,
+                bytes INTEGER,
+                cache_hit INTEGER
+            );`,
+            `CREATE TABLE IF NOT EXISTS ip_limits (
+                ip TEXT,
+                date TEXT,
+                count INTEGER DEFAULT 0,
+                updated_at INTEGER,
+                PRIMARY KEY (ip, date)
+            );`,
+
+            // ✅ 可选索引：不想要就删掉这三句（不影响功能）
+            `CREATE INDEX IF NOT EXISTS idx_access_logs_created_at ON access_logs(created_at);`,
+            `CREATE INDEX IF NOT EXISTS idx_access_logs_ip ON access_logs(ip);`,
+            `CREATE INDEX IF NOT EXISTS idx_ip_limits_date ON ip_limits(date);`
+        ];
+
+        // D1 batch 执行更快
+        await env.DB.batch(stmts.map(sql => env.DB.prepare(sql)));
+
+        __D1_SCHEMA_READY = true;
+    })();
+
+    return __D1_SCHEMA_PROMISE;
+}
 
 // ==============================================================================
 // 3. 辅助功能函数 (HMAC, Token, Docker, Linux, KV, Logging)
