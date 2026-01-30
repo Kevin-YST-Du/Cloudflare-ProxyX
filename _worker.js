@@ -96,7 +96,7 @@ const DEFAULT_CONFIG = {
     // 1. 完整 URL: "https://www.baidu.com"
     // 2. 纯域名: "www.baidu.com" (自动使用 https)
     // 3. 带路径: "example.com/about"
-    CAMOUFLAGE_URL: "https://blog.spacenb.com",
+    CAMOUFLAGE_URL: "blog.spacenb.com,blog.2055555.xyz",
 };
 
 // 支持的 Docker Registry 上游列表 (用于判断请求是否指向已知的 Registry)
@@ -170,7 +170,7 @@ export default {
             DAILY_LIMIT_COUNT: parseInt(env.DAILY_LIMIT_COUNT || DEFAULT_CONFIG.DAILY_LIMIT_COUNT),
             IP_LIMIT_WHITELIST: parseList(env.IP_LIMIT_WHITELIST, DEFAULT_CONFIG.IP_LIMIT_WHITELIST),
             FREE_PATHS: parseList(env.FREE_PATHS, DEFAULT_CONFIG.FREE_PATHS),
-            CAMOUFLAGE_URL: env.CAMOUFLAGE_URL || DEFAULT_CONFIG.CAMOUFLAGE_URL,
+            CAMOUFLAGE_URLS: parseList(env.CAMOUFLAGE_URL, DEFAULT_CONFIG.CAMOUFLAGE_URL),
             SIGN_SECRET: env.SIGN_SECRET || DEFAULT_CONFIG.SIGN_SECRET,
         };
 
@@ -319,7 +319,8 @@ export default {
 
                     // --- 伪装逻辑：不 return，生成 response 给 finally 记录日志 ---
                     if (!isAuthenticated) {
-                        let camoStr = CONFIG.CAMOUFLAGE_URL;
+                        const camoList = CONFIG.CAMOUFLAGE_URLS || [];
+                        let camoStr = camoList.length > 0 ? camoList[Math.floor(Math.random() * camoList.length)] : "";
 
                         if (camoStr && camoStr.trim() !== "") {
                             try {
