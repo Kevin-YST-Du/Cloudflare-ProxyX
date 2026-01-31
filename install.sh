@@ -95,7 +95,7 @@ VAR_IP_LIMIT_WHITELIST="127.0.0.1"
 VAR_ALLOW_REFERER="github.com,nodeseek.com"
 
 # v5.0 新增默认值
-VAR_SIGN_SECRET="change-me-to-a-secure-random-string"
+VAR_SIGN_SECRET="ionRAqxQqL5KGLjOYweuYBl7g0KkibrWbX/i8Tx+WCU="
 VAR_ALLOW_USER_AGENT=""
 VAR_FREE_PATHS="ubuntu,debian,centos,rockylinux,almalinux,fedora,alpine,kali,termux"
 VAR_CAMOUFLAGE_URL=""
@@ -147,7 +147,7 @@ if [ "$config_choice" == "2" ]; then
     # v5.0 新增配置
     echo "--- v5.0 高级功能 ---"
     read -p "HMAC 签名密钥 (用于生成免密链接) [默认随机字符串]: " input_sign
-    VAR_SIGN_SECRET=${input_sign:-"change-me-to-a-secure-random-string"}
+    VAR_SIGN_SECRET=${input_sign:-"ionRAqxQqL5KGLjOYweuYBl7g0KkibrWbX/i8Tx+WCU="}
 
     read -p "允许免密访问的 User-Agent [默认为空]: " input_ua
     VAR_ALLOW_USER_AGENT=${input_ua:-""}
