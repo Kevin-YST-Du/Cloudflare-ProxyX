@@ -270,15 +270,31 @@ export default {
                     const isAdminIp = CONFIG.ADMIN_IPS.includes(clientIP);
 
                     let isTrustedReferer = false;
-                    if (CONFIG.ALLOW_REFERER && referer) {
-                        const allowedRules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s => s.trim()).filter(s => s);
-                        for (const rule of allowedRules) {
-                            if (rule.includes("://") ? referer.startsWith(rule) : (referer.includes(rule))) {
-                                isTrustedReferer = true;
-                                break;
-                            }
-                        }
-                    }
+                    // 位于主 fetch 函数内
+      if (CONFIG.ALLOW_REFERER && referer) {
+          const allowedRules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s => s.trim()).filter(s => s);
+          let refUrl;
+          try { refUrl = new URL(referer); } catch(e) {}
+          
+          if (refUrl) {
+              for (const rule of allowedRules) {
+                  // 模式1: 完整 URL 前缀 (保持原逻辑)
+                  if (rule.includes("://")) {
+                      if (referer.startsWith(rule)) {
+                          isTrustedReferer = true;
+                          break;
+                      }
+                  } 
+                  // 模式2: 纯域名 - 严格校验 Hostname，防止 bypass
+                  else {
+                      if (refUrl.hostname === rule || refUrl.hostname.endsWith("." + rule)) {
+                          isTrustedReferer = true;
+                          break;
+                      }
+                  }
+              }
+          }
+      }
 
                     let isTrustedUA = false;
                     if (CONFIG.ALLOW_USER_AGENT && userAgent.includes(CONFIG.ALLOW_USER_AGENT.toLowerCase())) {
@@ -290,24 +306,57 @@ export default {
                     let subPath = "";
                     let isAuthenticated = false;
 
+                    // --- [增强 v5.4] 统一链接检查 (/s/) ---
                     if (path.startsWith('/s/')) {
-                        const parts = path.split('/');
-                        if (parts.length >= 5) {
-                            const exp = parts[2];
-                            const sig = parts[3];
-                            const target = parts.slice(4).join('/');
-
-                            const now = Math.floor(Date.now() / 1000);
-                            if (parseInt(exp) > now) {
-                                const isValid = await verifyHmac(CONFIG.SIGN_SECRET, `${exp}\n${target}`, sig);
-                                if (isValid) {
-                                    isAuthenticated = true;
-                                    subPath = target;
-                                    isTrusted = true;
+                        const parts = path.split('/').filter(p => p); // 去除空字符串
+                        
+                        // 格式1: /s/<key> 或 /s/<key>/<filename> (数据库模式)
+                        if (parts.length >= 2 && env.DB) {
+                            const key = parts[1]; // 始终取第二个片段作为 Key
+                            
+                            try {
+                                // 查询数据库
+                                const link = await env.DB.prepare("SELECT * FROM shared_links WHERE key = ?").bind(key).first();
+                                if (link) {
+                                    const now = Math.floor(Date.now() / 1000);
+                                    // 检查是否永久(0) 或 未过期
+                                    if (link.exp === 0 || link.exp > now) {
+                                        isAuthenticated = true;
+                                        subPath = link.target;
+                                        isTrusted = true;
+                                        // 异步更新统计
+                                        ctx.waitUntil(env.DB.prepare("UPDATE shared_links SET visit_count = visit_count + 1 WHERE id = ?").bind(link.id).run());
+                                    } else {
+                                        response = new Response("Link Expired", { status: 410 });
+                                        finalUpstream = "ExpiredLink";
+                                    }
                                 }
+                            } catch (e) { console.error("Link DB Error", e); }
+                        }
+                        
+                        // 位置：fetch 函数内，处理 /s/ 的逻辑 (替换上面的 else if 块)
+
+                    // 格式2: /s/<exp>/<sig>/<target> (v5.0 兼容模式，parts 至少4个部分)
+                    else if (parts.length >= 4) {
+                        // 注意：根据 split逻辑，parts[0]是's'
+                        // URL: /s/170000/signature/github.com
+                        const exp = parts[1]; 
+                        const sig = parts[2];
+                        const target = parts.slice(3).join('/');
+
+                        const now = Math.floor(Date.now() / 1000);
+                        // 验证过期时间
+                        if (parseInt(exp) > now) {
+                            // 验证签名
+                            const isValid = await verifyHmac(CONFIG.SIGN_SECRET, `${exp}\n${target}`, sig);
+                            if (isValid) {
+                                isAuthenticated = true;
+                                subPath = target;
+                                isTrusted = true;
                             }
                         }
                     }
+                }
 
                     if (!isAuthenticated) {
                         const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
@@ -333,13 +382,65 @@ export default {
                     }
 
                     // --- 管理员 API：全部 response=，不 return ---
-                    if (!response && subPath === "reset") {
+                    
+                    // [新增 v5.4] 链接管理 API
+                    if (subPath === "admin/links/create") {
                         if (!isAdminIp) {
-                            response = new Response("Forbidden: Admin IP Required", { status: 403 });
-                            finalUpstream = "AdminAPI";
+                            response = new Response("Forbidden", { status: 403 });
                         } else {
-                            ctx.waitUntil(resetIpUsage(clientIP, env));
-                            response = new Response(JSON.stringify({ status: "success" }), { status: 200 });
+                            const params = await request.json();
+                            const { target, seconds, note } = params; 
+                            
+                            // [修改] 生成 256长度 Hex 字符串（1024-bit 强随机）
+                            const randomBytes = new Uint8Array(128);
+                            crypto.getRandomValues(randomBytes);
+                            const key = Array.from(randomBytes).map(b => b.toString(16).padStart(2, '0')).join('');
+                            
+                            const now = Math.floor(Date.now() / 1000);
+                            // seconds <= 0 视为永久(0)，否则计算过期时间
+                            let exp = (seconds && parseInt(seconds) > 0) ? (now + parseInt(seconds)) : 0;
+                            
+                            try {
+                                await env.DB.prepare("INSERT INTO shared_links (key, target, exp, note, created_at) VALUES (?, ?, ?, ?, ?)")
+                                    .bind(key, target, exp, note || "", getDate() + " " + getTime().split(" ")[1])
+                                    .run();
+                                const fullUrl = `/s/${key}`;
+                                response = new Response(JSON.stringify({ status: "success", url: fullUrl, key: key }), { status: 200 });
+                            } catch (e) {
+                                response = new Response(JSON.stringify({ status: "error", message: e.message }), { status: 500 });
+                            }
+                            finalUpstream = "AdminAPI";
+                        }
+                    }
+
+
+                    // [新增] 获取链接列表 API
+                    if (!response && subPath === "admin/links/list") {
+                        if (!isAdminIp) {
+                            response = new Response("Forbidden", { status: 403 });
+                        } else {
+                            try {
+                                const links = await env.DB.prepare("SELECT * FROM shared_links ORDER BY id DESC LIMIT 100").all();
+                                response = new Response(JSON.stringify({ status: "success", data: links.results }), { status: 200 });
+                            } catch(e) {
+                                response = new Response(JSON.stringify({ status: "error", message: e.message }), { status: 500 });
+                            }
+                            finalUpstream = "AdminAPI";
+                        }
+                    }
+
+                    // [新增] 删除链接 API
+                    if (!response && subPath === "admin/links/delete") {
+                        if (!isAdminIp) {
+                            response = new Response("Forbidden", { status: 403 });
+                        } else {
+                            const params = await request.json();
+                            try {
+                                await env.DB.prepare("DELETE FROM shared_links WHERE id = ?").bind(params.id).run();
+                                response = new Response(JSON.stringify({ status: "success" }), { status: 200 });
+                            } catch(e) {
+                                response = new Response(JSON.stringify({ status: "error", message: e.message }), { status: 500 });
+                            }
                             finalUpstream = "AdminAPI";
                         }
                     }
@@ -474,9 +575,10 @@ export default {
                 const parsed = parseInt(cl || "", 10);
                 const bytes = Number.isFinite(parsed) ? parsed : -1;
 
-                if (shouldCharge && !isFreePath) {
-                    ctx.waitUntil(incrementIpUsage(clientIP, env));
-                }
+                // 只有当响应存在且状态码为 200-299 之间才扣费
+            if (shouldCharge && !isFreePath && response.status >= 200 && response.status < 300) {
+            ctx.waitUntil(incrementIpUsage(clientIP, env));
+        }
 
                 ctx.waitUntil(
                     logRequest(
@@ -543,6 +645,17 @@ async function ensureD1Schema(env) {
                 count INTEGER DEFAULT 0,
                 updated_at INTEGER,
                 PRIMARY KEY (ip, date)
+            );`,
+
+            // [新增] 共享链接表 (用于管理免密链接)
+            `CREATE TABLE IF NOT EXISTS shared_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                key TEXT UNIQUE,
+                target TEXT,
+                exp INTEGER, 
+                note TEXT,
+                created_at TEXT,
+                visit_count INTEGER DEFAULT 0
             );`,
 
             // ✅ 可选索引：不想要就删掉这三句（不影响功能）
@@ -1105,28 +1218,33 @@ async function handleLinuxMirrorRequest(request, upstreamBase, path) {
 // ==============================================================================
 async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw', ctx) {
     let currentUrlStr = targetUrlStr;
-    
-    // [修改] 容错增强：处理 Cloudflare 合并斜杠问题 (https:/ -> https://) 及补全协议
-    if (currentUrlStr.startsWith("http")) {
-        // 如果自带协议，强制修正斜杠数量为2个
-        currentUrlStr = currentUrlStr.replace(/^(https?):\/+/, '$1://');
-    } else {
-        // 如果没带协议，补全 https://
-        currentUrlStr = 'https://' + currentUrlStr;
-    }
+      
+      if (currentUrlStr.startsWith("http")) {
+          // 强制修复协议头的斜杠数量 (防止 https:/example.com)
+          currentUrlStr = currentUrlStr.replace(/^(https?):\/+/, '$1://');
+      } else {
+          currentUrlStr = 'https://' + currentUrlStr;
+      }
 
     // --- 缓存检查 (仅针对递归模式) ---
     // 递归模式涉及正则替换，消耗 CPU，且结果是纯文本，非常适合缓存。
     // 使用 request.url 作为缓存键。
-    const cache = caches.default;
-    const cacheKey = request.url; 
-    
-        if ((mode === 'recursive_all' || mode === 'recursive_text') && CONFIG.ENABLE_CACHE) {
-        const cachedResponse = await cache.match(cacheKey);
-        if (cachedResponse) {
-            return { response: cachedResponse, cacheHit: true }; // [修改 v5.0] 返回对象以传递 hit 状态
-        }
-    }
+    // 位于 handleGeneralProxy 函数开头
+      // 检测是否包含敏感头
+      const hasAuth = request.headers.has("Authorization") || request.headers.has("Cookie");
+      // 如果有敏感头，强制关闭当前请求的缓存
+      const shouldCache = CONFIG.ENABLE_CACHE && !hasAuth;
+
+      const cache = caches.default;
+      const cacheKey = request.url; 
+
+      // 使用 shouldCache 替代全局配置判断
+      if ((mode === 'recursive_all' || mode === 'recursive_text') && shouldCache) {
+          const cachedResponse = await cache.match(cacheKey);
+          if (cachedResponse) {
+              return { response: cachedResponse, cacheHit: true };
+          }
+      }
 
     let finalResponse = null;
     const originalHeaders = new Headers(request.headers);
@@ -1291,22 +1409,19 @@ async function handleGeneralProxy(request, targetUrlStr, CONFIG, mode = 'raw', c
 }
 
 // ==============================================================================
-// 4. Dashboard 渲染 (UI 界面 - 独立 UI 部分 - 自定义时间增强版 - 双语版)
+// 4. Dashboard 渲染 (UI 界面 - 修复层级与弹窗美化版)
 // ==============================================================================
 
 function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     const percent = Math.min(Math.round((count / limit) * 100), 100);
     const isAdmin = adminIps.includes(ip);
     
-    // 服务端直接生成 Linux 选项 HTML (保持原有逻辑)
+    // 生成 Linux 发行版选项
     let linuxOptionsHtml = '<option value="" disabled selected data-i18n="linux_select">请选择系统 (Select OS)...</option>';
-    
     if (typeof LINUX_MIRRORS !== 'undefined') {
-        const mirrors = Object.keys(LINUX_MIRRORS);
-        mirrors.forEach(distro => {
+        Object.keys(LINUX_MIRRORS).forEach(distro => {
             if (!distro.includes('-security')) {
-                const displayName = distro.charAt(0).toUpperCase() + distro.slice(1);
-                linuxOptionsHtml += `<option value="${distro}">${displayName}</option>`;
+                linuxOptionsHtml += `<option value="${distro}">${distro.charAt(0).toUpperCase() + distro.slice(1)}</option>`;
             }
         });
     } else {
@@ -1314,7 +1429,6 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
             linuxOptionsHtml += `<option value="${d.toLowerCase()}">${d}</option>`;
         });
     }
-
     const linuxMirrorsJson = (typeof LINUX_MIRRORS !== 'undefined') ? JSON.stringify(Object.keys(LINUX_MIRRORS)) : '[]';
 
     return `
@@ -1328,13 +1442,17 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,${encodeURIComponent(LIGHTNING_SVG)}">
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
+/* --- 基础样式 --- */
+
 body {
   min-height: 100vh;
   display: flex;
   align-items: center;
   justify-content: center;
+
   font-family: "Inter", sans-serif;
   transition: background-color 0.3s ease;
+
   padding: 1rem;
   margin: 0;
 }
@@ -1343,8 +1461,10 @@ body {
   width: 80% !important;
   max-width: 1200px !important;
   min-width: 320px;
+
   margin: auto;
   padding: 1rem;
+
   border-radius: 1.5rem;
 }
 
@@ -1352,14 +1472,15 @@ body {
   border-radius: 1rem;
   padding: 2rem;
   margin-bottom: 1.5rem;
+
   transition: all 0.2s;
   position: relative;
   z-index: 1;
 }
 
-/* ---------------------------
-   Light Mode
----------------------------- */
+
+/* --- Light Mode --- */
+
 .light-mode {
   background-color: #f3f4f6;
   color: #1f293b;
@@ -1395,9 +1516,9 @@ body {
   border: 1px solid #fca5a5;
 }
 
-/* ---------------------------
-   Dark Mode
----------------------------- */
+
+/* --- Dark Mode --- */
+
 .dark-mode {
   background-color: #0f172a;
   color: #e2e8f0;
@@ -1431,6 +1552,7 @@ body {
 .dark-mode .reset-btn {
   background-color: white;
   color: #ef4444;
+
   border: none;
   box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
 }
@@ -1439,13 +1561,14 @@ body {
   background-color: #f1f5f9;
 }
 
-/* ---------------------------
-   Elements
----------------------------- */
+
+/* --- Elements --- */
+
 input,
 select {
   outline: none;
   transition: all 0.2s;
+
   appearance: none;
   -webkit-appearance: none;
 }
@@ -1470,14 +1593,15 @@ pre,
   -webkit-user-select: text !important;
 }
 
-/* ---------------------------
-   Nav
----------------------------- */
+
+/* --- Nav --- */
+
 .top-nav {
   position: fixed;
   top: 1.5rem;
   right: 1.5rem;
   z-index: 50;
+
   display: flex;
   gap: 0.75rem;
 }
@@ -1486,14 +1610,18 @@ pre,
   width: 2.5rem;
   height: 2.5rem;
   border-radius: 9999px;
+
   background: rgba(255, 255, 255, 0.5);
   backdrop-filter: blur(4px);
   border: 1px solid rgba(0, 0, 0, 0.05);
+
   display: flex;
   align-items: center;
   justify-content: center;
+
   cursor: pointer;
   transition: all 0.2s;
+
   color: #64748b;
   font-weight: bold;
   font-size: 0.8rem;
@@ -1515,24 +1643,30 @@ pre,
   background: rgba(255, 255, 255, 0.2);
 }
 
-/* ---------------------------
-   Toast & Modals
----------------------------- */
+
+/* --- Toast ---  */
+
 .toast {
   position: fixed;
   bottom: 3rem;
   left: 50%;
   transform: translateX(-50%) translateY(20px);
+
   padding: 0.75rem 1.5rem;
   border-radius: 0.5rem;
-  z-index: 100;
+
+  z-index: 9999;
   color: white;
+
   opacity: 0;
   transition: all 0.3s;
   pointer-events: none;
+
   font-weight: 500;
   font-size: 0.9rem;
+
   box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
+
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -1543,15 +1677,22 @@ pre,
   transform: translateX(-50%) translateY(0);
 }
 
+
+/* --- [重要修复] Modal Z-Index 层级管理 --- */
+
+/* 第一层弹窗 (如日志列表) z-index: 50 */
 .modal-overlay {
   position: fixed;
   inset: 0;
-  z-index: 999;
+  z-index: 50;
+
   background: rgba(0, 0, 0, 0.6);
   backdrop-filter: blur(4px);
+
   display: flex;
   align-items: center;
   justify-content: center;
+
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.2s;
@@ -1562,12 +1703,19 @@ pre,
   pointer-events: auto;
 }
 
+/* 第二层弹窗 (如删除确认框、详情框) z-index: 60 -> 必须高于第一层 */
+.modal-overlay-top {
+  z-index: 60 !important;
+}
+
 .modal-content {
   background: white;
   width: 95%;
   max-width: 400px;
+
   padding: 2rem;
   border-radius: 1.25rem;
+
   box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
   transform: scale(0.9);
   transition: transform 0.2s;
@@ -1587,13 +1735,14 @@ pre,
   color: #f1f5f9;
 }
 
-/* ---------------------------
-   Logs Table
----------------------------- */
+
+/* --- Logs Table --- */
+
 .log-table {
   width: 100%;
   border-collapse: collapse;
   font-size: 0.75rem;
+
   table-layout: fixed !important;
   min-width: 700px;
 }
@@ -1608,6 +1757,7 @@ pre,
 .log-table td {
   padding: 0.5rem;
   border-bottom: 1px solid #f1f5f9;
+
   font-family: monospace;
   word-break: break-all;
   cursor: pointer;
@@ -1629,6 +1779,7 @@ pre,
 .log-table td > div.truncate {
   width: 100% !important;
   max-width: 100% !important;
+
   white-space: nowrap !important;
   overflow: hidden !important;
   text-overflow: ellipsis !important;
@@ -1638,8 +1789,10 @@ pre,
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
+
   margin-bottom: 15px;
   padding-bottom: 15px;
+
   border-bottom: 1px solid #e2e8f0;
   align-items: center;
 }
@@ -1651,8 +1804,10 @@ pre,
 .log-btn {
   padding: 6px 12px;
   border-radius: 6px;
+
   font-size: 0.75rem;
   font-weight: bold;
+
   cursor: pointer;
   border: 1px solid transparent;
   transition: all 0.2s;
@@ -1682,9 +1837,9 @@ pre,
   border-color: #1e40af;
 }
 
-/* ---------------------------
-   Responsive
----------------------------- */
+
+/* --- Responsive --- */
+
 @media (max-width: 768px) {
   .custom-content-wrapper {
     width: 100% !important;
@@ -1704,16 +1859,11 @@ pre,
     width: 100% !important;
   }
 
+  .log-table th:nth-child(5),
+  .log-table td:nth-child(5),
   .log-table th:nth-child(6),
-  .log-table td:nth-child(6),
-  .log-table th:nth-child(7),
-  .log-table td:nth-child(7) {
+  .log-table td:nth-child(6) {
     display: none !important;
-  }
-
-  #sign-custom-container:not(.hidden) {
-    width: 100%;
-    justify-content: center;
   }
 }
 
@@ -1721,490 +1871,213 @@ pre,
   word-wrap: break-word;
   white-space: pre-wrap;
   font-family: monospace;
+
   max-height: 60vh;
   overflow-y: auto;
 }
 
-#logDetailModal {
-  z-index: 1000 !important;
+
+/* --- [Link Manager 专用样式] --- */
+
+.link-table-mgr {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.75rem;
+
+  table-layout: fixed;
+  min-width: 600px;
 }
 
-/* ---------------------------
-   Custom Time Input
----------------------------- */
-#sign-custom-container:not(.hidden) {
-  display: flex !important;
-  align-items: center;
-  height: 46px;
-  padding: 0 0.5rem !important;
-  background-color: white;
-  border: 1px solid #e5e7eb;
-  border-radius: 0.5rem;
-}
+.link-table-mgr th {
+  text-align: left;
+  padding: 0.75rem 0.5rem;
 
-.dark-mode #sign-custom-container:not(.hidden) {
-  background-color: #1e293b;
-  border-color: #334155;
-  color: #f1f5f9;
-}
+  border-bottom: 1px solid #e2e8f0;
+  opacity: 0.7;
 
-#sign-custom-container input {
-  background: transparent !important;
-  border: none !important;
-  text-align: center;
   font-weight: 600;
-  padding: 0 !important;
-  margin: 0 2px;
-  width: 2.5rem;
-  outline: none !important;
-  box-shadow: none !important;
-  color: inherit;
+  white-space: nowrap;
 }
-body {
-  min-height: 100vh;
-  display: flex;
+
+.link-table-mgr td {
+  padding: 0.5rem;
+  border-bottom: 1px solid #f1f5f9;
+
+  vertical-align: middle;
+  cursor: pointer;
+}
+
+.link-table-mgr td:hover {
+  background-color: rgba(99, 102, 241, 0.05);
+}
+
+.dark-mode .link-table-mgr th,
+.dark-mode .link-table-mgr td {
+  border-color: #334155;
+}
+
+.dark-mode .link-table-mgr td:hover {
+  background-color: rgba(99, 102, 241, 0.1);
+}
+
+
+/* --- 操作按钮通用样式 - 文字版 --- */
+
+.btn-action {
+  display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-family: "Inter", sans-serif;
-  transition: background-color 0.3s ease;
-  padding: 1rem;
-  margin: 0;
+
+  padding: 3px 10px;
+  border-radius: 6px;
+
+  font-size: 0.7rem;
+  font-weight: 700;
+
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: all 0.2s ease;
+
+  margin-left: 6px;
+  text-decoration: none !important;
+
+  line-height: 1.4;
+  white-space: nowrap;
 }
 
-.custom-content-wrapper {
-  width: 80% !important;
-  max-width: 1200px !important;
-  min-width: 320px;
-  margin: auto;
-  padding: 1rem;
-  border-radius: 1.5rem;
+.btn-action:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
 }
 
-.section-box {
-  border-radius: 1rem;
-  padding: 2rem;
-  margin-bottom: 1.5rem;
-  transition: all 0.2s;
-  position: relative;
-  z-index: 1;
+
+/* --- 复制按钮 (蓝) --- */
+
+.btn-copy {
+  background-color: #eff6ff;
+  color: #4f46e5;
+  border-color: #c7d2fe;
 }
 
-/* ---------------------------
-   Light Mode
----------------------------- */
-.light-mode {
-  background-color: #f3f4f6;
-  color: #1f293b;
+.btn-copy:hover {
+  background-color: #e0e7ff;
+  border-color: #818cf8;
 }
 
-.light-mode .custom-content-wrapper {
-  background: white;
-  border: 1px solid #e5e7eb;
-  box-shadow: 0 10px 25px -5px rgba(0, 0, 0, 0.05);
+.dark-mode .btn-copy {
+  background-color: #1e1b4b;
+  color: #a5b4fc;
+  border-color: #312e81;
 }
 
-.light-mode .section-box {
-  background: #f8fafc;
-  border: 1px solid #e2e8f0;
+.dark-mode .btn-copy:hover {
+  background-color: #312e81;
+  border-color: #4f46e5;
 }
 
-.light-mode input,
-.light-mode select {
-  background: white;
+
+/* --- 访问按钮 (绿) --- */
+
+.btn-visit {
+  background-color: #ecfdf5;
+  color: #059669;
+  border-color: #a7f3d0;
+}
+
+.btn-visit:hover {
+  background-color: #d1fae5;
+  border-color: #34d399;
+}
+
+.dark-mode .btn-visit {
+  background-color: #064e3b;
+  color: #6ee7b7;
+  border-color: #065f46;
+}
+
+.dark-mode .btn-visit:hover {
+  background-color: #065f46;
+  border-color: #10b981;
+}
+
+
+/* --- 删除按钮 (红) --- */
+
+.btn-del {
+  background-color: #fee2e2;
+  color: #ef4444;
+  border-color: #fca5a5;
+}
+
+.btn-del:hover {
+  background-color: #fecaca;
+  border-color: #f87171;
+}
+
+.dark-mode .btn-del {
+  background-color: #450a0a;
+  color: #fca5a5;
+  border-color: #7f1d1d;
+}
+
+.dark-mode .btn-del:hover {
+  background-color: #7f1d1d;
+  border-color: #ef4444;
+}
+
+
+/* ---Key 链接样式 --- */
+
+.link-key {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: #2563eb;
+
+  font-weight: 700;
+  cursor: pointer;
+  transition: color 0.2s;
+}
+
+.link-key:hover {
+  text-decoration: underline;
+  color: #1d4ed8;
+}
+
+.dark-mode .link-key {
+  color: #60a5fa;
+}
+
+.dark-mode .link-key:hover {
+  color: #93c5fd;
+}
+
+
+/* --- 自定义时间输入框 --- */
+
+.time-input-group input {
+  text-align: center;
+  padding: 0.5rem;
+  width: 3rem;
+
+  background: transparent;
   border: 1px solid #d1d5db;
-  color: #1f293b;
+  border-radius: 0.375rem;
+
+  font-size: 0.875rem;
 }
 
-.light-mode .code-area {
-  background: #f1f5f9;
-  border: 1px solid #e2e8f0;
-  color: #334155;
-}
-
-.light-mode .reset-btn {
-  background: #fee2e2;
-  color: #ef4444;
-  border: 1px solid #fca5a5;
-}
-
-/* ---------------------------
-   Dark Mode
----------------------------- */
-.dark-mode {
-  background-color: #0f172a;
-  color: #e2e8f0;
-}
-
-.dark-mode .custom-content-wrapper {
-  background: transparent;
-  border: none;
-  box-shadow: none;
-}
-
-.dark-mode .section-box {
-  background-color: #1e293b;
-  border: 1px solid #334155;
-  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.2);
-}
-
-.dark-mode input,
-.dark-mode select {
-  background-color: #0f172a;
-  border: 1px solid #3b82f6;
-  color: #f1f5f9;
-}
-
-.dark-mode .code-area {
-  background-color: #020617;
-  border: 1px solid #1e293b;
-  color: #e2e8f0;
-}
-
-.dark-mode .reset-btn {
-  background-color: white;
-  color: #ef4444;
-  border: none;
-  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
-}
-
-.dark-mode .reset-btn:hover {
-  background-color: #f1f5f9;
-}
-
-/* ---------------------------
-   Elements
----------------------------- */
-input,
-select {
-  outline: none;
-  transition: all 0.2s;
-  appearance: none;
-  -webkit-appearance: none;
-}
-
-input:focus,
-select:focus {
-  ring: 2px #3b82f6;
-  ring-offset: 2px;
-}
-
-.dark-mode input:focus,
-.dark-mode select:focus {
-  ring: 0;
-  border-color: #60a5fa;
-  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
-}
-
-.code-area,
-pre,
-.select-all {
-  user-select: text !important;
-  -webkit-user-select: text !important;
-}
-
-/* ---------------------------
-   Nav
----------------------------- */
-.top-nav {
-  position: fixed;
-  top: 1.5rem;
-  right: 1.5rem;
-  z-index: 50;
-  display: flex;
-  gap: 0.75rem;
-}
-
-.nav-btn {
-  width: 2.5rem;
-  height: 2.5rem;
-  border-radius: 9999px;
-  background: rgba(255, 255, 255, 0.5);
-  backdrop-filter: blur(4px);
-  border: 1px solid rgba(0, 0, 0, 0.05);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.2s;
-  color: #64748b;
-  font-weight: bold;
-  font-size: 0.8rem;
-}
-
-.nav-btn:hover {
-  transform: scale(1.1);
-  background: white;
-  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
-}
-
-.dark-mode .nav-btn {
-  background: rgba(255, 255, 255, 0.1);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  color: #e2e8f0;
-}
-
-.dark-mode .nav-btn:hover {
-  background: rgba(255, 255, 255, 0.2);
-}
-
-/* ---------------------------
-   Toast & Modals
----------------------------- */
-.toast {
-  position: fixed;
-  bottom: 3rem;
-  left: 50%;
-  transform: translateX(-50%) translateY(20px);
-  padding: 0.75rem 1.5rem;
-  border-radius: 0.5rem;
-  z-index: 100;
+.dark-mode .time-input-group input {
+  border-color: #475569;
   color: white;
-  opacity: 0;
-  transition: all 0.3s;
-  pointer-events: none;
-  font-weight: 500;
-  font-size: 0.9rem;
-  box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3);
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-}
-
-.toast.show {
-  opacity: 1;
-  transform: translateX(-50%) translateY(0);
-}
-
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  z-index: 999;
-  background: rgba(0, 0, 0, 0.6);
-  backdrop-filter: blur(4px);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  opacity: 0;
-  pointer-events: none;
-  transition: opacity 0.2s;
-}
-
-.modal-overlay.open {
-  opacity: 1;
-  pointer-events: auto;
-}
-
-.modal-content {
-  background: white;
-  width: 95%;
-  max-width: 400px;
-  padding: 2rem;
-  border-radius: 1.25rem;
-  box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.25);
-  transform: scale(0.9);
-  transition: transform 0.2s;
-}
-
-.modal-content-lg {
-  max-width: 1000px;
-}
-
-.modal-overlay.open .modal-content {
-  transform: scale(1);
-}
-
-.dark-mode .modal-content {
-  background: #1e293b;
-  border: 1px solid #334155;
-  color: #f1f5f9;
-}
-
-/* ---------------------------
-   Logs Table
----------------------------- */
-.log-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.75rem;
-  table-layout: fixed !important;
-  min-width: 700px;
-}
-
-.log-table th {
-  text-align: left;
-  padding: 0.5rem;
-  border-bottom: 1px solid #e2e8f0;
-  opacity: 0.7;
-}
-
-.log-table td {
-  padding: 0.5rem;
-  border-bottom: 1px solid #f1f5f9;
-  font-family: monospace;
-  word-break: break-all;
-  cursor: pointer;
-}
-
-.log-table td:hover {
-  background-color: rgba(59, 130, 246, 0.1);
-}
-
-.dark-mode .log-table th,
-.dark-mode .log-table td {
-  border-color: #334155;
-}
-
-.dark-mode .log-table td:hover {
-  background-color: rgba(59, 130, 246, 0.2);
-}
-
-.log-table td > div.truncate {
-  width: 100% !important;
-  max-width: 100% !important;
-  white-space: nowrap !important;
-  overflow: hidden !important;
-  text-overflow: ellipsis !important;
-}
-
-.log-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-bottom: 15px;
-  padding-bottom: 15px;
-  border-bottom: 1px solid #e2e8f0;
-  align-items: center;
-}
-
-.dark-mode .log-toolbar {
-  border-bottom-color: #334155;
-}
-
-.log-btn {
-  padding: 6px 12px;
-  border-radius: 6px;
-  font-size: 0.75rem;
-  font-weight: bold;
-  cursor: pointer;
-  border: 1px solid transparent;
-  transition: all 0.2s;
-}
-
-.btn-red {
-  background: #fee2e2;
-  color: #ef4444;
-  border-color: #fca5a5;
-}
-
-.btn-blue {
-  background: #dbeafe;
-  color: #2563eb;
-  border-color: #bfdbfe;
-}
-
-.dark-mode .btn-red {
-  background: #7f1d1d;
-  color: #fca5a5;
-  border-color: #991b1b;
-}
-
-.dark-mode .btn-blue {
-  background: #1e3a8a;
-  color: #93c5fd;
-  border-color: #1e40af;
-}
-
-/* ---------------------------
-   Responsive
----------------------------- */
-@media (max-width: 768px) {
-  .custom-content-wrapper {
-    width: 100% !important;
-    padding: 0.5rem;
-  }
-
-  .section-box {
-    padding: 1.25rem !important;
-  }
-
-  .flex-responsive {
-    flex-direction: column !important;
-    gap: 0.75rem !important;
-  }
-
-  .flex-responsive button {
-    width: 100% !important;
-  }
-
-  .log-table th:nth-child(6),
-  .log-table td:nth-child(6),
-  .log-table th:nth-child(7),
-  .log-table td:nth-child(7) {
-    display: none !important;
-  }
-
-  #sign-custom-container:not(.hidden) {
-    width: 100%;
-    justify-content: center;
-  }
-}
-
-#log-detail-modal-content {
-  word-wrap: break-word;
-  white-space: pre-wrap;
-  font-family: monospace;
-  max-height: 60vh;
-  overflow-y: auto;
-}
-
-#logDetailModal {
-  z-index: 1000 !important;
-}
-
-/* ---------------------------
-   Custom Time Input
----------------------------- */
-#sign-custom-container:not(.hidden) {
-  display: flex !important;
-  align-items: center;
-  height: 46px;
-  padding: 0 0.5rem !important;
-  background-color: white;
-  border: 1px solid #e5e7eb;
-  border-radius: 0.5rem;
-}
-
-.dark-mode #sign-custom-container:not(.hidden) {
-  background-color: #1e293b;
-  border-color: #334155;
-  color: #f1f5f9;
-}
-
-#sign-custom-container input {
-  background: transparent !important;
-  border: none !important;
-  text-align: center;
-  font-weight: 600;
-  padding: 0 !important;
-  margin: 0 2px;
-  width: 2.5rem;
-  outline: none !important;
-  box-shadow: none !important;
-  color: inherit;
 }
     </style>
 </head>
 <body class="light-mode">
     <div class="top-nav">
-       <button onclick="toggleLanguage()" class="nav-btn" aria-label="Toggle Language">
-         <span id="lang-text">CN</span>
-       </button>
+       <button onclick="toggleLanguage()" class="nav-btn" aria-label="Toggle Language"><span id="lang-text">CN</span></button>
        <a href="https://github.com/Kevin-YST-Du/Cloudflare-ProxyX" target="_blank" class="nav-btn" aria-label="GitHub Repository">
          <svg class="w-5 h-5" fill="currentColor" viewBox="0 0 24 24"><path fill-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.531 1.032 1.531 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" clip-rule="evenodd"></path></svg>
        </a>
-       <button onclick="toggleTheme()" class="nav-btn" aria-label="Toggle Theme">
-         <span class="sun text-lg">☀️</span><span class="moon hidden text-lg">🌙</span>
-       </button>
+       <button onclick="toggleTheme()" class="nav-btn" aria-label="Toggle Theme"><span class="sun text-lg">☀️</span><span class="moon hidden text-lg">🌙</span></button>
     </div>
     
     <div class="custom-content-wrapper">
@@ -2215,99 +2088,107 @@ pre,
       <div class="section-box relative">
         <div class="flex flex-col md:flex-row justify-between items-center mb-4 gap-4">
           <div class="flex items-center gap-3">
-             <div class="relative flex h-3 w-3">
-                <span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
-                <span class="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
-             </div>
+             <div class="relative flex h-3 w-3"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span><span class="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span></div>
              <p class="text-sm font-bold opacity-90 tracking-wide">IP: <span class="font-mono text-blue-600 dark:text-blue-400">${ip}</span></p>
           </div>
-          
           <div class="flex items-center gap-4 w-full md:w-auto justify-between md:justify-end">
-              <div class="text-sm font-medium opacity-80">
-                  <span data-i18n="daily_limit">今日额度</span>: <span class="text-blue-600 dark:text-blue-400 font-bold">${count}</span> <span class="opacity-50">/ ${limit}</span>
-              </div>
+              <div class="text-sm font-medium opacity-80"><span data-i18n="daily_limit">今日额度</span>: <span class="text-blue-600 dark:text-blue-400 font-bold">${count}</span> <span class="opacity-50">/ ${limit}</span></div>
               <div class="flex gap-2">
                 <button onclick="openModal('confirmModal')" class="reset-btn px-3 py-1.5 rounded-lg text-xs font-bold transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm">
-                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                    <span data-i18n="reset_limit">重置额度</span>
-                </button>
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg><span data-i18n="reset_limit">重置额度</span></button>
                 ${isAdmin ? `
-                <button onclick="viewAllStats()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-blue-100 text-blue-600 border border-blue-200 hover:bg-blue-200 transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm">
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg>
-                    <span data-i18n="admin_stats">全站统计</span>
-                </button>
-                <button onclick="openLogsModal()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-purple-100 text-purple-600 border border-purple-200 hover:bg-purple-200 transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm">
-                    <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"></path></svg>
-                    <span data-i18n="access_logs">访问日志</span>
-                </button>
+                <button onclick="viewAllStats()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-blue-100 text-blue-600 border border-blue-200 hover:bg-blue-200 transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"></path></svg><span data-i18n="admin_stats">全站统计</span></button>
+                <button onclick="openLogsModal()" class="px-3 py-1.5 rounded-lg text-xs font-bold bg-purple-100 text-purple-600 border border-purple-200 hover:bg-purple-200 transition-transform hover:scale-105 flex items-center gap-1.5 shadow-sm"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4"></path></svg><span data-i18n="access_logs">访问日志</span></button>
                 ` : ''}
               </div>
           </div>
         </div>
-        
         <div class="w-full bg-gray-200 dark:bg-slate-700 rounded-full h-2.5 overflow-hidden mb-3">
           <div class="bg-blue-600 dark:bg-blue-500 h-full transition-all duration-1000 ease-out" style="width: ${percent}%"></div>
         </div>
-        <p class="text-[11px] opacity-60 flex items-center gap-1">
-          <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-          <span data-i18n="limit_desc">失败自动退还额度 · 短时重复请求不扣费 · <span class="text-green-600 dark:text-green-400 font-bold">软件源镜像 (Ubuntu 等) 免费不限量</span></span>
-        </p>
-
+        <p class="text-[11px] opacity-60 flex items-center gap-1"><svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg><span data-i18n="limit_desc">失败自动退还额度 · 短时重复请求不扣费 · <span class="text-green-600 dark:text-green-400 font-bold">软件源镜像 (Ubuntu 等) 免费不限量</span></span></p>
         <div id="stats-panel" class="hidden mt-4 p-4 rounded-xl bg-gray-50 dark:bg-slate-800/50 border border-gray-200 dark:border-slate-700">
-            <div class="flex justify-between items-center mb-2">
-                <h4 class="text-xs font-bold opacity-70 uppercase tracking-wider" data-i18n="stats_overview">今日全站概况</h4>
-                ${isAdmin ? `
-                <button onclick="openModal('confirmResetAllModal')" class="text-[10px] text-red-500 hover:text-red-700 font-bold border border-red-200 hover:border-red-400 bg-red-50 hover:bg-red-100 px-2 py-0.5 rounded transition" data-i18n="reset_all_data">
-                清空全站数据
-                </button>
-                ` : ''}
-            </div>
-            
-            <div class="mb-2 text-xs font-mono text-blue-600 dark:text-blue-400 border-b border-gray-200 dark:border-slate-700 pb-2">
-                 <span id="stats-summary" data-i18n="loading">正在加载...</span>
-            </div>
-
-            <div id="stats-list" class="max-h-40 overflow-y-auto text-[10px] font-mono divide-y divide-gray-100 dark:divide-slate-700 pr-2">
-            </div>
+            <div class="flex justify-between items-center mb-2"><h4 class="text-xs font-bold opacity-70 uppercase tracking-wider" data-i18n="stats_overview">今日全站概况</h4>${isAdmin ? `<button onclick="openModal('confirmResetAllModal')" class="text-[10px] text-red-500 hover:text-red-700 font-bold border border-red-200 hover:border-red-400 bg-red-50 hover:bg-red-100 px-2 py-0.5 rounded transition" data-i18n="reset_all_data">清空全站数据</button>` : ''}</div>
+            <div class="mb-2 text-xs font-mono text-blue-600 dark:text-blue-400 border-b border-gray-200 dark:border-slate-700 pb-2"><span id="stats-summary" data-i18n="loading">正在加载...</span></div>
+            <div id="stats-list" class="max-h-40 overflow-y-auto text-[10px] font-mono divide-y divide-gray-100 dark:divide-slate-700 pr-2"></div>
         </div>
       </div>
       
       ${isAdmin ? `
       <div class="section-box">
         <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
-          <svg class="w-5 h-5 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"></path></svg>
-          <span data-i18n="hmac_title">签名链接生成 (免密分享)</span>
+          <svg class="w-5 h-5 text-indigo-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1"></path></svg>
+          <span data-i18n="link_manager_title">免密链接管理 (Link Manager)</span>
         </h2>
-        <div class="flex flex-col md:flex-row gap-3 mb-2">
-          <input id="sign-target" type="text" placeholder="目标 URL (如 https://github.com/...)" data-i18n-placeholder="hmac_placeholder" class="flex-grow p-3.5 rounded-lg text-sm w-full">
-          
-          <div class="flex gap-2 w-full md:w-auto">
-              <select id="sign-ttl" onchange="toggleSignTtl()" class="flex-1 md:flex-none p-3.5 rounded-lg text-sm bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700">
-                  <option value="3600" data-i18n="1_hour">1 小时</option>
-                  <option value="86400" data-i18n="24_hours">24 小时</option>
-                  <option value="600" data-i18n="10_mins">10 分钟</option>
-                  <option value="custom" data-i18n="custom_time">自定义...</option>
-              </select>
-              
-              <div id="sign-custom-container" class="hidden flex items-center gap-1 bg-white dark:bg-slate-900 border border-indigo-200 dark:border-indigo-800 rounded-lg px-2">
-                  <input id="ttl-days" type="number" placeholder="天" class="w-12 p-2 text-center text-sm bg-transparent outline-none" min="0">
-                  <span class="text-xs opacity-50">d</span>
-                  <input id="ttl-hours" type="number" placeholder="时" class="w-12 p-2 text-center text-sm bg-transparent outline-none" min="0">
-                  <span class="text-xs opacity-50">h</span>
-                  <input id="ttl-minutes" type="number" placeholder="分" class="w-12 p-2 text-center text-sm bg-transparent outline-none" min="0">
-                  <span class="text-xs opacity-50">m</span>
-              </div>
+        
+        <div class="bg-indigo-50 dark:bg-slate-800 p-5 rounded-xl mb-6 border border-indigo-100 dark:border-slate-700 shadow-sm">
+            <div class="flex flex-col gap-4">
+                <div class="relative">
+                    <input id="link-target" type="text" placeholder="目标 URL (Target URL, e.g., https://github.com/...)" class="p-3 pl-4 rounded-lg text-sm w-full border border-gray-300 dark:border-slate-600 bg-white dark:bg-slate-900 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 transition-shadow">
+                </div>
+                
+                <div class="flex flex-col md:flex-row gap-3">
+                    <input id="link-note" type="text" placeholder="备注 (Note, e.g., 给朋友)" class="p-3 rounded-lg text-sm flex-grow border border-gray-300 dark:border-slate-600 bg-white dark:bg-slate-900 focus:ring-2 focus:ring-indigo-500">
+                    
+                    <div class="flex flex-col md:flex-row gap-2">
+                        <select id="link-ttl" onchange="toggleLinkTimeInput()" class="p-3 rounded-lg text-sm border border-gray-300 dark:border-slate-600 bg-white dark:bg-slate-900 focus:ring-2 focus:ring-indigo-500 cursor-pointer min-w-[120px]">
+                            <option value="-1">♾️ 永久 (Permanent)</option>
+                            <option value="3600">⏳ 1 小时</option>
+                            <option value="86400">⏳ 24 小时</option>
+                            <option value="604800">📅 7 天</option>
+                            <option value="2592000">🗓️ 30 天</option>
+                            <option value="custom">⚙️ 自定义...</option>
+                        </select>
+                        <div id="link-custom-time" class="hidden flex items-center gap-1 time-input-group">
+                            <input type="number" id="ttl-d" placeholder="d" min="0" title="Days"> <span class="text-xs opacity-50">d</span>
+                            <input type="number" id="ttl-h" placeholder="h" min="0" title="Hours"> <span class="text-xs opacity-50">h</span>
+                            <input type="number" id="ttl-m" placeholder="m" min="0" title="Minutes"> <span class="text-xs opacity-50">m</span>
+                        </div>
+                    </div>
+                    
+                    <button onclick="createLink()" class="bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg font-bold text-sm shadow-md transition-transform hover:scale-[1.02] active:scale-95 w-full md:w-auto flex items-center justify-center gap-2 whitespace-nowrap">
+                        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"></path></svg>
+                        生成链接
+                    </button>
+                </div>
+            </div>
 
-              <button onclick="generateSignedUrl()" class="flex-none bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3.5 rounded-lg transition font-bold text-sm shadow-md whitespace-nowrap">
-                  <span data-i18n="gen_link">生成链接</span>
-              </button>
-          </div>
+            <div id="link-create-result" class="hidden mt-4 p-4 bg-white dark:bg-slate-900 rounded-lg border border-indigo-200 dark:border-indigo-800 cursor-pointer group relative hover:border-indigo-400 transition-colors" onclick="copyCreatedLink()">
+                 <div class="flex justify-between items-center mb-1">
+                    <p class="text-xs font-bold text-gray-400 uppercase tracking-wider">Generated Link:</p>
+                    <span class="text-[10px] text-indigo-400 opacity-0 group-hover:opacity-100 transition-opacity">点击复制</span>
+                 </div>
+                 <p class="text-sm text-indigo-600 dark:text-indigo-400 font-mono break-all font-bold" id="created-link-url"></p>
+            </div>
         </div>
-        <div id="sign-result-box" class="hidden">
-           <div class="p-3 bg-indigo-50 dark:bg-indigo-900/20 border border-indigo-100 dark:border-indigo-800 rounded-lg mb-2 cursor-pointer" onclick="copySignedUrl()">
-               <p id="sign-result" class="text-indigo-700 dark:text-indigo-400 font-mono text-xs break-all"></p>
-           </div>
-           <p class="text-[10px] opacity-60" data-i18n="hmac_note">* 此链接包含签名，有效期内可免密访问，请妥善保管。</p>
+
+        <div class="flex justify-between items-end mb-3 border-b border-gray-100 dark:border-slate-800 pb-2">
+            <h3 class="text-sm font-bold opacity-80 flex items-center gap-2">
+                <svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"></path></svg>
+                已生成的链接列表
+            </h3>
+            <button onclick="loadLinks()" class="text-xs bg-white border border-gray-200 hover:bg-gray-50 dark:bg-slate-800 dark:border-slate-700 dark:hover:bg-slate-700 px-3 py-1.5 rounded transition flex items-center gap-1 shadow-sm">
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"></path></svg>
+                刷新列表
+            </button>
+        </div>
+        
+        <div class="max-h-[500px] overflow-y-auto border border-gray-200 dark:border-slate-700 rounded-xl scrollbar-thin scrollbar-thumb-gray-300 dark:scrollbar-thumb-slate-600">
+            <div style="overflow-x: auto; width: 100%;">
+                <table class="link-table-mgr">
+                    <thead class="bg-gray-50 dark:bg-slate-800 sticky top-0 z-10 backdrop-blur-sm bg-opacity-95">
+                        <tr>
+                            <th width="15%">Key / 备注</th>
+                            <th width="40%">目标 / 访问</th>
+                            <th width="15%">状态</th>
+                            <th width="30%" class="text-right">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="links-tbody" class="bg-white dark:bg-slate-900 divide-y divide-gray-100 dark:divide-slate-800">
+                        <tr><td colspan="4" class="text-center py-8 opacity-50 text-xs">点击上方“刷新列表”加载数据...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
       </div>
       ` : ''}
@@ -2324,7 +2205,6 @@ pre,
               <span data-i18n="get_link">获取链接</span>
           </button>
         </div>
-        
         <div id="github-result-box" class="hidden mt-5">
            <div class="mb-6">
                <p class="text-xs font-bold text-gray-500 dark:text-gray-400 mb-2 uppercase tracking-wide" data-i18n="raw_url_label">1. 加速链接 (Raw URL):</p>
@@ -2351,21 +2231,17 @@ pre,
           <span class="text-xl">🚀</span> <span data-i18n="recursive_title">递归脚本加速 (Shell / Curl)</span>
         </h2>
         <p class="text-xs opacity-60 mb-3" data-i18n="recursive_desc">适用于 curl | bash 脚本。可选择强制重写所有 (/r/) 或仅文本递归 (/rt/)。</p>
-
         <div class="flex flex-responsive gap-3">
           <select id="recursive-mode" class="flex-none p-3.5 rounded-lg text-sm bg-gray-50 dark:bg-slate-800 border-r-8 border-transparent outline-none">
               <option value="r" data-i18n="mode_r">/r/ 强制重写所有</option>
               <option value="rt" data-i18n="mode_rt">/rt/ 仅文本递归</option>
           </select>
-
           <input id="recursive-url" type="text" placeholder="如: https://get.docker.com" data-i18n-placeholder="recursive_placeholder" class="flex-grow p-3.5 rounded-lg text-sm">
-
           <button onclick="convertRecursiveUrl()" class="bg-blue-600 hover:bg-blue-700 text-white px-6 py-3.5 rounded-lg transition font-bold text-sm shadow-md whitespace-nowrap flex items-center justify-center gap-1">
                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19.428 15.428a2 2 0 00-1.022-.547l-2.384-.477a6 6 0 00-3.86.517l-.318.158a6 6 0 01-3.86.517L6.05 15.21a2 2 0 00-1.806.547M8 4h8l-1 1v5.172a2 2 0 00.586 1.414l5 5c1.26 1.26.367 3.414-1.415 3.414H4.828c-1.782 0-2.674-2.154-1.414-3.414l5-5A2 2 0 009 10.172V5L8 4z"/></svg>
                <span data-i18n="gen_cmd">生成命令</span>
           </button>
         </div>
-        
         <div id="recursive-result-box" class="hidden mt-5">
               <div class="mb-6">
                   <p id="recursive-url-label" class="text-xs font-bold text-gray-500 dark:text-gray-400 mb-2 uppercase tracking-wide">1. Raw URL:</p>
@@ -2419,7 +2295,6 @@ pre,
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
               </div>
           </div>
-          
           <button onclick="generateLinuxCommand()" class="bg-orange-600 hover:bg-orange-700 text-white px-6 py-3.5 rounded-lg transition font-bold text-sm shadow-md whitespace-nowrap flex items-center justify-center gap-1 w-full md:w-auto">
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
               <span data-i18n="gen_mirror_cmd">生成换源命令</span>
@@ -2436,7 +2311,7 @@ pre,
             <button onclick="copyLinuxCommand()" class="w-full bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition" data-i18n="copy_cmd">复制命令</button>
         </div>
       </div>
-  
+ 
       <div class="section-box">
           <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
               <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
@@ -2455,12 +2330,12 @@ pre,
               <span data-i18n="copy_config">复制配置</span>
           </button>
       </div>
-  
+ 
       <footer class="mt-12 text-center pb-8">
             <a href="https://github.com/Kevin-YST-Du/Cloudflare-ProxyX" target="_blank" class="text-[10px] text-blue-600 dark:text-blue-400 uppercase tracking-widest font-bold opacity-80 hover:opacity-100 hover:underline transition-all">Powered by Kevin-YST-Du/Cloudflare-ProxyX</a>
       </footer>
     </div>
-  
+
     <div id="confirmModal" class="modal-overlay">
       <div class="modal-content">
          <div class="text-center">
@@ -2494,6 +2369,71 @@ pre,
       </div>
     </div>
 
+    <div id="linkDeleteModal" class="modal-overlay modal-overlay-top">
+      <div class="modal-content">
+         <div class="text-center">
+            <div class="w-12 h-12 bg-red-100 dark:bg-red-900/30 rounded-full flex items-center justify-center mb-4 mx-auto text-red-500">
+              <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+            </div>
+            <h3 class="text-lg font-bold mb-2">高危操作：</h3>
+            <p class="text-sm opacity-70 mb-6 px-4">确定要永久删除此链接吗？<br>删除后该链接将立即失效。</p>
+            <div class="flex gap-3">
+               <button onclick="closeModal('linkDeleteModal')" class="flex-1 px-4 py-2.5 bg-gray-100 hover:bg-gray-200 dark:bg-slate-700 dark:hover:bg-slate-600 rounded-lg text-sm font-bold transition">取消</button>
+               <button onclick="confirmDeleteLink()" class="flex-1 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-lg text-sm font-bold transition shadow-lg shadow-red-500/30">确定</button>
+            </div>
+         </div>
+      </div>
+    </div>
+    
+    <div id="logDeleteModal" class="modal-overlay modal-overlay-top">
+      <div class="modal-content">
+         <div class="text-center">
+            <div class="w-12 h-12 bg-red-100 dark:bg-red-900/30 rounded-full flex items-center justify-center mb-4 mx-auto text-red-500">
+              <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
+            </div>
+            <h3 class="text-lg font-bold mb-2">删除日志</h3>
+            <p class="text-sm opacity-70 mb-6 px-4">确定要永久删除这条访问日志吗？<br>此操作不可恢复。</p>
+            <div class="flex gap-3">
+               <button onclick="closeModal('logDeleteModal')" class="flex-1 px-4 py-2.5 bg-gray-100 hover:bg-gray-200 dark:bg-slate-700 dark:hover:bg-slate-600 rounded-lg text-sm font-bold transition">取消</button>
+               <button onclick="confirmDeleteLog()" class="flex-1 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-lg text-sm font-bold transition shadow-lg shadow-red-500/30">确定</button>
+            </div>
+         </div>
+      </div>
+    </div>
+
+    <div id="confirmDeleteDaysModal" class="modal-overlay modal-overlay-top">
+      <div class="modal-content">
+         <div class="text-center">
+            <div class="w-12 h-12 bg-red-100 dark:bg-red-900/30 rounded-full flex items-center justify-center mb-4 mx-auto text-red-500">
+              <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
+            </div>
+            <h3 class="text-lg font-bold mb-2">批量清理日志</h3>
+            <p class="text-sm opacity-70 mb-6 px-4">确定要删除 <span id="days-to-delete-text" class="font-bold text-red-500"></span> 天前的所有日志吗？<br>此操作不可恢复。</p>
+            <div class="flex gap-3">
+               <button onclick="closeModal('confirmDeleteDaysModal')" class="flex-1 px-4 py-2.5 bg-gray-100 hover:bg-gray-200 dark:bg-slate-700 dark:hover:bg-slate-600 rounded-lg text-sm font-bold transition">取消</button>
+               <button onclick="confirmDeleteDaysAction()" class="flex-1 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-lg text-sm font-bold transition shadow-lg shadow-red-500/30">确定删除</button>
+            </div>
+         </div>
+      </div>
+    </div>
+    
+    <div id="linkDetailModal" class="modal-overlay modal-overlay-top">
+      <div class="modal-content">
+         <div class="flex justify-between items-center mb-4 border-b border-gray-100 dark:border-slate-700 pb-2">
+             <h3 class="text-lg font-bold">📄 完整内容详情</h3>
+             <button onclick="closeModal('linkDetailModal')" class="text-gray-500 hover:text-gray-700 dark:text-gray-400">
+                 <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+             </button>
+         </div>
+         <div class="bg-gray-50 dark:bg-slate-800 p-4 rounded-lg border border-gray-200 dark:border-slate-700">
+             <div id="link-detail-content" class="text-sm text-gray-800 dark:text-gray-200 break-words select-all font-mono space-y-2"></div>
+         </div>
+         <div class="mt-4 text-right">
+             <button onclick="closeModal('linkDetailModal')" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-bold transition">关闭</button>
+         </div>
+      </div>
+    </div>
+
     <div id="logsModal" class="modal-overlay">
       <div class="modal-content modal-content-lg">
           <div class="flex justify-between items-center mb-4">
@@ -2505,10 +2445,6 @@ pre,
           
           <div class="log-toolbar">
               <div class="flex items-center gap-2">
-                  <button onclick="deleteSelectedLogs()" class="log-btn btn-red flex items-center gap-1">
-                      <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                      <span data-i18n="delete_selected">删除选中</span>
-                  </button>
                   <button onclick="exportLogsCsv()" class="log-btn bg-green-100 text-green-600 border border-green-200 dark:bg-green-900 dark:text-green-300 dark:border-green-800 flex items-center gap-1">
                       <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"/></svg>
                       <span data-i18n="export_csv">导出CSV</span>
@@ -2546,13 +2482,13 @@ pre,
                 <table class="log-table">
                     <thead class="bg-gray-50 dark:bg-slate-800 sticky top-0">
                         <tr>
-                            <th class="check-col"><input type="checkbox" id="select-all-logs" onchange="toggleSelectAllLogs()"></th>
                             <th width="15%" data-i18n="col_time">时间</th>
                             <th width="8%" data-i18n="col_status">状态</th>
                             <th width="12%">IP</th>
                             <th width="35%" data-i18n="col_path">访问路径</th>
                             <th width="20%" data-i18n="col_upstream">上游</th>
                             <th width="10%" data-i18n="col_perf">耗时/大小</th>
+                            <th width="8%" class="text-center">操作</th>
                         </tr>
                     </thead>
                     <tbody id="logs-table-body" class="bg-white dark:bg-slate-900">
@@ -2563,25 +2499,9 @@ pre,
       </div>
     </div>
 
-    <div id="universalConfirmModal" class="modal-overlay">
-      <div class="modal-content">
-         <div class="text-center">
-            <div class="w-12 h-12 bg-red-100 dark:bg-red-900/30 rounded-full flex items-center justify-center mb-4 mx-auto text-red-500">
-              <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/></svg>
-            </div>
-            <h3 id="uni-confirm-title" class="text-lg font-bold mb-2">Confirm?</h3>
-            <p id="uni-confirm-desc" class="text-sm opacity-70 mb-6 px-4">Action cannot be undone.</p>
-            <div class="flex gap-3">
-               <button onclick="closeModal('universalConfirmModal')" class="flex-1 px-4 py-2.5 bg-gray-100 hover:bg-gray-200 dark:bg-slate-700 dark:hover:bg-slate-600 rounded-lg text-sm font-bold transition" data-i18n="cancel">Cancel</button>
-               <button onclick="performPendingAction()" class="flex-1 px-4 py-2.5 bg-red-500 hover:bg-red-600 text-white rounded-lg text-sm font-bold transition shadow-lg shadow-red-500/30" data-i18n="confirm">Confirm</button>
-            </div>
-         </div>
-      </div>
-    </div>
-
     <div id="toast" class="toast bg-slate-800 text-white"></div>
     
-    <div id="logDetailModal" class="modal-overlay">
+    <div id="logDetailModal" class="modal-overlay modal-overlay-top">
       <div class="modal-content">
          <div class="flex justify-between items-center mb-4 border-b border-gray-100 dark:border-slate-700 pb-2">
              <h3 class="text-lg font-bold" data-i18n="detail_title">📄 完整内容详情</h3>
@@ -2600,7 +2520,7 @@ pre,
     </div>
 
     <script>
-      // --- I18N Configuration ---
+      // --- I18N Configuration (Full retained) ---
       const I18N_DATA = {
         "en": {
             "main_title": "Cloudflare Accelerator",
@@ -2612,14 +2532,9 @@ pre,
             "stats_overview": "Global Overview Today",
             "reset_all_data": "Clear All Data",
             "loading": "Loading...",
-            "hmac_title": "Sign Link Gen (Password-free)",
+            "link_manager_title": "Shared Link Manager (DB)",
             "hmac_placeholder": "Target URL (e.g., https://github.com/...)",
-            "1_hour": "1 Hour",
-            "24_hours": "24 Hours",
-            "10_mins": "10 Mins",
-            "custom_time": "Custom...",
             "gen_link": "Generate",
-            "hmac_note": "* Link contains signature for password-free access. Keep it safe.",
             "github_title": "GitHub File / Script Accelerator",
             "github_placeholder": "Paste URL or bash/curl/git command",
             "get_link": "Get Link",
@@ -2680,14 +2595,9 @@ pre,
             "stats_overview": "今日全站概况",
             "reset_all_data": "清空全站数据",
             "loading": "正在加载...",
-            "hmac_title": "签名链接生成 (免密分享)",
+            "link_manager_title": "免密链接管理 (Link Manager)",
             "hmac_placeholder": "目标 URL (如 https://github.com/...)",
-            "1_hour": "1 小时",
-            "24_hours": "24 小时",
-            "10_mins": "10 分钟",
-            "custom_time": "自定义...",
             "gen_link": "生成链接",
-            "hmac_note": "* 此链接包含签名，有效期内可免密访问，请妥善保管。",
             "github_title": "GitHub 文件 / 脚本命令加速",
             "github_placeholder": "粘贴 链接 或 bash/curl/git 完整命令",
             "get_link": "获取链接",
@@ -2740,26 +2650,21 @@ pre,
         }
       };
 
-        // --- 从当前 URL 自动推导前缀："/<password>" ---
-        // 假设你的页面访问路径是：https://domain.com/<password> 或 /<password>/
         function getApiPrefixFromPath() {
         const parts = (window.location.pathname || '').split('/').filter(Boolean);
-        // parts[0] 预期就是 password
         if (!parts || parts.length === 0) return '';
         return '/' + parts[0];
     }
 
-        // --- 初始化全局变量 ---
         window.CURRENT_DOMAIN = window.location.hostname;
-        window.API_PREFIX = getApiPrefixFromPath();                       // "/<password>"
-        window.PROXY_PREFIX = window.location.origin + window.API_PREFIX + '/'; // "https://domain/<password>/"
+        window.API_PREFIX = getApiPrefixFromPath(); 
+        window.PROXY_PREFIX = window.location.origin + window.API_PREFIX + '/';
 
         window.CURRENT_CLIENT_IP = "${ip}";
         window.LINUX_MIRRORS = ${linuxMirrorsJson};
         window.ALL_LOGS = [];
         window.FILTERED_LOGS = [];
-        window.currentLang = 'zh'; // Default
-
+        window.currentLang = 'zh';
 
       let githubAcceleratedUrl = '';
       let githubOpenUrl = '';
@@ -2788,20 +2693,17 @@ pre,
           const data = I18N_DATA[lang];
           if (!data) return;
 
-          // Replace Text Content
           document.querySelectorAll('[data-i18n]').forEach(el => {
               const key = el.getAttribute('data-i18n');
-              if (data[key]) el.innerHTML = data[key]; // Use innerHTML to support span colors
+              if (data[key]) el.innerHTML = data[key];
           });
 
-          // Replace Placeholders
           document.querySelectorAll('[data-i18n-placeholder]').forEach(el => {
               const key = el.getAttribute('data-i18n-placeholder');
               if (data[key]) el.setAttribute('placeholder', data[key]);
           });
       }
 
-      // --- 提示框 (Toast) 工具 ---
       window.showToast = function(message, isError = false) {
         const toast = document.getElementById('toast');
         if (!toast) return;
@@ -2810,17 +2712,9 @@ pre,
         setTimeout(() => toast.classList.remove('show'), 3000);
       }
 
-      // --- 模态框控制 ---
-      window.openModal = function(id) {
-        const el = document.getElementById(id);
-        if (el) el.classList.add('open');
-      }
-      window.closeModal = function(id) {
-        const el = document.getElementById(id);
-        if (el) el.classList.remove('open');
-      }
+      window.openModal = function(id) { const el = document.getElementById(id); if (el) el.classList.add('open'); }
+      window.closeModal = function(id) { const el = document.getElementById(id); if (el) el.classList.remove('open'); }
 
-      // --- 剪贴板复制工具 ---
       window.copyToClipboard = function(text) {
         if (navigator.clipboard && window.isSecureContext) { return navigator.clipboard.writeText(text); }
         const textArea = document.createElement("textarea");
@@ -2830,7 +2724,6 @@ pre,
         catch (err) { document.body.removeChild(textArea); return Promise.reject(err); }
       }
 
-      // --- 格式化字节 ---
       window.formatBytes = function(bytes) {
           try {
               const b = parseInt(bytes);
@@ -2842,7 +2735,6 @@ pre,
           } catch (e) { return '-'; }
       }
 
-      // --- 主题切换逻辑 ---
       window.toggleTheme = function() {
         try {
             const body = document.body;
@@ -2862,9 +2754,7 @@ pre,
         } catch(e) { console.error('Theme toggle error:', e); }
       }
 
-      // ======================================================================
-      // 核心逻辑: GitHub/通用加速
-      // ======================================================================
+      // --- GitHub Logic ---
       window.convertGithubUrl = function() {
         let input = document.getElementById('github-url').value.trim();
         if (!input) return window.showToast('❌ 请输入内容', true);
@@ -2909,8 +2799,6 @@ pre,
         githubCommand = finalCommand;
 
         document.getElementById('github-result-url').textContent = proxiedUrl;
-        // Update label text based on language if possible, but keep simple for now
-        // document.getElementById('github-cmd-label').textContent = "2. " + label; 
         document.getElementById('github-result-cmd').textContent = finalCommand;
         document.getElementById('github-result-box').classList.remove('hidden');
       }
@@ -2919,9 +2807,7 @@ pre,
       window.openGithubUrl = function() { window.open(githubOpenUrl, '_blank'); }
       window.copyGithubCmd = function() { window.copyToClipboard(githubCommand).then(() => window.showToast('✅ 命令已复制')); }
 
-      // ======================================================================
-      // 核心逻辑: 递归脚本加速
-      // ======================================================================
+      // --- Recursive Logic ---
       window.convertRecursiveUrl = function() {
         let input = document.getElementById('recursive-url').value.trim();
         if (!input) return window.showToast('❌ 请输入链接', true);
@@ -2975,7 +2861,7 @@ pre,
       window.openRecursiveUrl = function() { window.open(recursiveUrlOnly, '_blank'); }
       window.copyRecursiveCmd = function() { window.copyToClipboard(recursiveCommand).then(() => window.showToast('✅ 命令已复制')); }
 
-      // --- 业务逻辑: Docker 镜像 ---
+      // --- Docker Logic ---
       window.convertDockerImage = function() {
         const input = document.getElementById('docker-image').value.trim();
         if (!input) return window.showToast('❌ 请输入镜像名', true);
@@ -2986,13 +2872,10 @@ pre,
       }
       window.copyDockerCommand = function() { window.copyToClipboard(dockerCommand).then(() => window.showToast('✅ 已复制')); }
 
-      // --- 业务逻辑: Linux 换源 ---
+      // --- Linux Logic ---
       window.generateLinuxCommand = function() {
           const distro = document.getElementById('linux-distro').value;
-          
-          if (!distro || distro === "") {
-              return window.showToast('❌ 请先选择一个系统 (如 Ubuntu)', true);
-          }
+          if (!distro || distro === "") { return window.showToast('❌ 请先选择一个系统', true); }
 
           const baseUrl = window.location.origin + window.API_PREFIX + '/' + distro + '/';
           const securityUrl = window.location.origin + window.API_PREFIX + '/' + distro + '-security/';
@@ -3037,10 +2920,9 @@ pre,
           window.copyToClipboard(linuxCommand).then(() => window.showToast('✅ 已复制换源命令'));
       }
       window.copyLinuxCommand = function() { window.copyToClipboard(linuxCommand).then(() => window.showToast('✅ 已复制')); }
-
       window.copyDaemonJson = function() { window.copyToClipboard(daemonJsonStr).then(() => window.showToast('✅ JSON 配置已复制')); }
 
-      // --- 业务逻辑: 重置额度 ---
+      // --- Admin Functions ---
       window.confirmReset = async function() {
         window.closeModal('confirmModal');
         try {
@@ -3092,61 +2974,221 @@ pre,
             } catch (e) { console.error(e); window.showToast('❌ 网络错误', true); }
         }
 
-      // --- [增强 v5.0] 生成签名链接逻辑 ---
-      window.toggleSignTtl = function() {
-          const select = document.getElementById('sign-ttl');
-          const customContainer = document.getElementById('sign-custom-container');
-          if (select.value === 'custom') {
-              customContainer.classList.remove('hidden');
-          } else {
-              customContainer.classList.add('hidden');
-          }
+      // --- [新增] Link Manager 逻辑 (增强版) ---
+      window.CURRENT_LINK_ID_TO_DELETE = null;
+      window.ALL_LINKS = []; // 存储所有链接数据以便模态框调用
+
+      // 切换自定义时间输入框显示
+      window.toggleLinkTimeInput = function() {
+          const val = document.getElementById('link-ttl').value;
+          const custom = document.getElementById('link-custom-time');
+          if(val === 'custom') custom.classList.remove('hidden');
+          else custom.classList.add('hidden');
       }
 
-      window.generateSignedUrl = async function() {
-          const target = document.getElementById('sign-target').value.trim();
-          let seconds = document.getElementById('sign-ttl').value;
+      // 1. 创建链接 (支持自定义时间 & 自动文件名)
+      window.createLink = async function() {
+          const target = document.getElementById('link-target').value.trim();
+          const note = document.getElementById('link-note').value.trim();
+          let ttl = document.getElementById('link-ttl').value;
+          const btn = document.querySelector('button[onclick="createLink()"]');
           
-          if (seconds === 'custom') {
-              const d = parseInt(document.getElementById('ttl-days').value || 0);
-              const h = parseInt(document.getElementById('ttl-hours').value || 0);
-              const m = parseInt(document.getElementById('ttl-minutes').value || 0);
-              seconds = (d * 86400) + (h * 3600) + (m * 60);
-              
-              if (seconds <= 0) {
-                  return window.showToast('❌ 请输入有效的时间', true);
+          if (!target) return window.showToast('❌ 请输入目标 URL', true);
+          
+          // 处理自定义时间
+          if (ttl === 'custom') {
+              const d = parseInt(document.getElementById('ttl-d').value || 0);
+              const h = parseInt(document.getElementById('ttl-h').value || 0);
+              const m = parseInt(document.getElementById('ttl-m').value || 0);
+              // 如果全为0或空，则提示无效
+              const totalSeconds = (d * 86400) + (h * 3600) + (m * 60);
+              if (totalSeconds <= 0) {
+                  return window.showToast('❌ 请输入有效的自定义时间 (至少1分钟)', true);
               }
+              ttl = totalSeconds;
           }
 
-          if (!target) return window.showToast('❌ 请输入目标 URL', true);
-          try {
-              const res = await fetch(window.API_PREFIX + '/sign-url', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ target, seconds })
-                });
+          // UI Loading
+          const originalHtml = btn.innerHTML;
+          btn.innerHTML = '<span class="animate-spin mr-1">↻</span> 生成中...';
+          btn.disabled = true;
 
-              const result = await res.json();
-              if (res.ok && result.status === 'success') {
-                  const fullUrl = window.location.origin + result.url;
-                  document.getElementById('sign-result').textContent = fullUrl;
-                  document.getElementById('sign-result-box').classList.remove('hidden');
+          try {
+              const res = await fetch(window.API_PREFIX + '/admin/links/create', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ target, note, seconds: ttl })
+              });
+              const data = await res.json();
+              
+              if (res.ok && data.status === 'success') {
+                  let fullUrl = location.origin + data.url;
+                  // [智能功能] 自动检测并追加文件名
+                  try {
+                      const urlPath = new URL(target).pathname;
+                      const parts = urlPath.split('/');
+                      const filename = parts.length > 0 ? parts[parts.length - 1] : '';
+                      if (filename && filename.includes('.') && !filename.startsWith('.')) {
+                          fullUrl += '/' + filename;
+                      }
+                  } catch(e) {}
+
+                  document.getElementById('created-link-url').textContent = fullUrl;
+                  document.getElementById('link-create-result').classList.remove('hidden');
+                  window.showToast('✅ 链接创建成功');
+                  
+                  // 重置输入
+                  document.getElementById('link-target').value = '';
+                  document.getElementById('link-note').value = '';
+                  
+                  // 刷新列表
+                  loadLinks();
               } else {
-                  window.showToast('❌ 生成失败: ' + (result.message || '未知错误'), true);
+                  window.showToast('❌ ' + (data.message || '创建失败'), true);
               }
-          } catch(e) { window.showToast('❌ 网络错误', true); }
+          } catch (e) { 
+              window.showToast('❌ 网络错误', true); 
+          } finally {
+              btn.innerHTML = originalHtml;
+              btn.disabled = false;
+          }
       }
-      
-      window.copySignedUrl = function() {
-          const url = document.getElementById('sign-result').textContent;
+
+      window.copyCreatedLink = function() {
+          const url = document.getElementById('created-link-url').textContent;
           if(url) window.copyToClipboard(url).then(() => window.showToast('✅ 链接已复制'));
       }
+      
+      // [新增] 列表内复制按钮调用此函数
+      window.copyLinkItem = function(url) {
+          window.copyToClipboard(url).then(() => window.showToast('✅ 链接已复制'));
+      }
 
-      // ==========================================
-      // 🟢 日志管理与筛选函数 (Fix Missing Functions)
-      // ==========================================
+      window.loadLinks = async function() {
+          const tbody = document.getElementById('links-tbody');
+          if(!tbody) return;
+          
+          tbody.innerHTML = '<tr><td colspan="4" class="text-center py-8 opacity-60 text-xs"><span class="animate-pulse">正在加载数据...</span></td></tr>';
+          
+          try {
+              const res = await fetch(window.API_PREFIX + '/admin/links/list');
+              const data = await res.json();
+              
+              if (res.ok && data.status === 'success') {
+                  window.ALL_LINKS = data.data || []; // 存储全局数据
+                  const links = window.ALL_LINKS;
+                  
+                  if (!links || links.length === 0) {
+                      tbody.innerHTML = '<tr><td colspan="4" class="text-center py-8 opacity-50 text-xs">暂无生成的链接</td></tr>';
+                      return;
+                  }
+                  
+                  let html = '';
+                  const now = Math.floor(Date.now() / 1000);
+                  
+                  links.forEach((l, index) => {
+                      const isExpired = l.exp > 0 && l.exp < now;
+                      let statusBadge = '';
+                      
+                      if (l.exp === 0) {
+                          statusBadge = '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-300 ring-1 ring-inset ring-green-600/20">♾️ 永久有效</span>';
+                      } else if (isExpired) {
+                          statusBadge = '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-300 ring-1 ring-inset ring-red-600/20">❌ 已过期</span>';
+                      } else {
+                          const dateObj = new Date(l.exp * 1000);
+                          const dateStr = dateObj.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+                          statusBadge = '<span class="inline-flex items-center px-2 py-0.5 rounded text-[10px] font-medium bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-300 ring-1 ring-inset ring-blue-600/20">📅 ' + dateStr + '</span>';
+                      }
+                      
+                      const fullUrl = location.origin + '/s/' + l.key;
+                      // 防止 XSS (简易处理)
+                      const safeTarget = (l.target || '').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+                      const safeNote = (l.note || '-').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+                      
+                      html += '<tr class="hover:bg-indigo-50 dark:hover:bg-slate-800/50 transition-colors group">';
+                      // Key/Note 列：点击弹出详情
+                      html += '<td class="py-3" onclick="openLinkDetail('+index+')"><div class="flex flex-col"><div class="link-key text-xs font-mono truncate max-w-[80px]" title="点击查看详情">'+l.key+'</div><span class="text-[10px] text-gray-500 dark:text-gray-400 mt-0.5 truncate max-w-[100px]">'+safeNote+'</span></div></td>';
+                      // Target/Visit 列：点击弹出详情
+                      html += '<td class="py-3" onclick="openLinkDetail('+index+')"><div class="flex flex-col"><div class="text-xs font-mono text-gray-600 dark:text-gray-300 truncate max-w-[120px] md:max-w-[200px]" title="点击查看完整URL">'+safeTarget+'</div><span class="text-[10px] text-gray-400 mt-0.5 flex items-center gap-1"><svg class="w-3 h-3 opacity-70" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"></path></svg>访问: '+(l.visit_count || 0)+'</span></div></td>';
+                      // Status 列
+                      html += '<td class="py-3">'+statusBadge+'</td>';
+                      // Action 列: 复制(蓝), 访问(绿), 删除(红) - 文字按钮
+                      html += '<td class="py-3 text-right">';
+                      html +=   '<div class="flex items-center justify-end gap-1">';
+                      html +=     '<button onclick="copyLinkItem(\\''+fullUrl+'\\')" class="btn-action btn-copy" title="复制完整链接">复制</button>';
+                      html +=     '<a href="'+fullUrl+'" target="_blank" class="btn-action btn-visit" title="在新标签页打开">访问</a>';
+                      html +=     '<button onclick="prepareDeleteLink('+l.id+')" class="btn-action btn-del" title="永久删除">删除</button>';
+                      html +=   '</div>';
+                      html += '</td>';
+                      html += '</tr>';
+                  });
+                  tbody.innerHTML = html;
+              } else {
+                  tbody.innerHTML = '<tr><td colspan="4" class="text-center py-8 text-red-500 text-xs">❌ '+ (data.message || '加载失败') +'</td></tr>';
+              }
+          } catch(e) { 
+              tbody.innerHTML = '<tr><td colspan="4" class="text-center py-8 text-red-500 text-xs">❌ 网络连接错误</td></tr>';
+          }
+      }
 
-      // 1. 筛选与渲染日志 (Filter & Render)
+      // [新增] 打开链接详情模态框
+      window.openLinkDetail = function(index) {
+          const link = window.ALL_LINKS[index];
+          if(!link) return;
+          
+          const fullUrl = location.origin + '/s/' + link.key;
+          const content = 
+            '【Key】: ' + link.key + '\\n' +
+            '【完整链接】: ' + fullUrl + '\\n' + 
+            '【目标地址】: ' + link.target + '\\n' +
+            '【备注信息】: ' + (link.note || '无') + '\\n' +
+            '【过期时间】: ' + (link.exp === 0 ? '永久有效' : new Date(link.exp * 1000).toLocaleString()) + '\\n' +
+            '【访问次数】: ' + link.visit_count;
+            
+          document.getElementById('link-detail-content').innerText = content;
+          window.openModal('linkDetailModal');
+      }
+
+      // [新增] 准备删除 (打开确认框)
+      window.prepareDeleteLink = function(id) {
+          window.CURRENT_LINK_ID_TO_DELETE = id;
+          window.openModal('linkDeleteModal');
+      }
+
+      // [新增] 确认删除 (执行 API)
+      window.confirmDeleteLink = async function() {
+          const id = window.CURRENT_LINK_ID_TO_DELETE;
+          if(!id) return;
+          
+          const btn = document.querySelector('#linkDeleteModal .bg-red-500');
+          const originalText = btn.innerText;
+          btn.innerText = '删除中...';
+          btn.disabled = true;
+
+          try {
+              const res = await fetch(window.API_PREFIX + '/admin/links/delete', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ id })
+              });
+              const data = await res.json();
+              if(res.ok && data.status === 'success') {
+                  window.showToast('✅ 链接已删除');
+                  window.closeModal('linkDeleteModal');
+                  loadLinks(); 
+              } else {
+                  window.showToast('❌ 删除失败: ' + (data.message || ''), 1);
+              }
+          } catch(e) { 
+              window.showToast('❌ 网络错误', 1); 
+          } finally {
+              btn.innerText = originalText;
+              btn.disabled = false;
+              window.CURRENT_LINK_ID_TO_DELETE = null;
+          }
+      }
+
+      // --- Logs Functions ---
       window.filterLogs = function() {
           const input = document.getElementById('log-search').value.toLowerCase();
           const statusFilter = document.getElementById('log-status-filter').value;
@@ -3154,9 +3196,7 @@ pre,
           if (!window.ALL_LOGS) window.ALL_LOGS = [];
           
           window.FILTERED_LOGS = window.ALL_LOGS.filter(log => {
-              // 搜索关键词 (IP 或 URL)
               const matchSearch = (log.ip && log.ip.includes(input)) || (log.url && log.url.toLowerCase().includes(input));
-              // 状态码筛选
               let matchStatus = true;
               if (statusFilter !== 'all') {
                   const s = log.status;
@@ -3167,84 +3207,104 @@ pre,
               }
               return matchSearch && matchStatus;
           });
-
           renderLogsTable(window.FILTERED_LOGS);
       }
 
-      // 2. 渲染表格 DOM (已修复：使用单引号拼接，防止 Worker 报错)
+      // ✅ 修改：使用了 Link Manager 的样式，并移除了 check-col
       function renderLogsTable(logs) {
           const tbody = document.getElementById('logs-table-body');
           if (!logs || logs.length === 0) {
               tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 opacity-60">没有符合条件的日志</td></tr>';
               return;
           }
-
-          // [新增] 安全转义，防止 title 属性破坏 HTML 结构
           const escapeHtml = (unsafe) => {
-              return (unsafe || "").toString()
-                  .replace(/&/g, "&amp;")
-                  .replace(/</g, "&lt;")
-                  .replace(/>/g, "&gt;")
-                  .replace(/"/g, "&quot;")
-                  .replace(/'/g, "&#039;");
+              return (unsafe || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
           }
-
           let html = '';
           logs.forEach(log => {
-              // 状态码颜色
               let statusColor = 'text-green-600 dark:text-green-400';
               if (log.status >= 300 && log.status < 400) statusColor = 'text-yellow-600 dark:text-yellow-400';
               if (log.status >= 400) statusColor = 'text-red-600 dark:text-red-400';
-
-              // 缓存标记
               const cacheBadge = log.cache_hit ? '<span class="px-1 py-0.5 rounded bg-green-100 dark:bg-green-900 text-green-600 dark:text-green-400 text-[10px] ml-1">HIT</span>' : '';
-
-              // ⚠️ 关键修改：这里全部改用单引号 + 字符串拼接
+              
               html += '<tr class="hover:bg-gray-50 dark:hover:bg-slate-800 transition">';
-              html += '<td class="check-col"><input type="checkbox" class="log-check" value="' + log.id + '"></td>';
+              // Checkbox 已移除
+              // Time
               html += '<td>' + log.time.replace('T', ' ') + '</td>';
+              // Status
               html += '<td class="font-bold ' + statusColor + '">' + log.status + '</td>';
-              
-              // 增加 title 属性 (Tooltip) [修正] 使用 escapeHtml
+              // IP
               html += '<td class="text-blue-600 dark:text-blue-400" title="' + escapeHtml(log.ip) + '">' + log.ip + '</td>';
+              // Path
               html += '<td title="' + escapeHtml(log.url) + '"><div class="truncate w-64">' + log.url + '</div></td>';
+              // Upstream
               html += '<td class="opacity-70" title="' + escapeHtml(log.upstream) + '"><div class="truncate w-32">' + log.upstream + '</div></td>';
-              
+              // Perf
               html += '<td class="opacity-70">' + log.duration + 'ms / ' + window.formatBytes(log.bytes) + cacheBadge + '</td>';
+              
+              // ✅ 修改：单独删除按钮 (样式统一为 Link Manager 风格)
+              html += '<td class="text-center">';
+              html +=   '<button onclick="deleteSingleLog(' + log.id + ', event)" class="btn-action btn-del" title="删除此条日志">删除</button>';
+              html += '</td>';
+
               html += '</tr>';
           });
           tbody.innerHTML = html;
       }
 
-      // 3. 全选/反选
-      window.toggleSelectAllLogs = function() {
-          const checked = document.getElementById('select-all-logs').checked;
-          document.querySelectorAll('.log-check').forEach(box => box.checked = checked);
+      // ✅ 变量：用于存储待删除日志ID
+      window.CURRENT_LOG_ID_TO_DELETE = null;
+      window.DAYS_TO_DELETE = null;
+
+      // ✅ 修改：删除单条日志的逻辑 (打开 Modal)
+      window.deleteSingleLog = function(id, event) {
+          if (event) event.stopPropagation();
+          window.CURRENT_LOG_ID_TO_DELETE = id;
+          window.openModal('logDeleteModal');
       }
 
-      // 4. 删除选中日志
-      window.deleteSelectedLogs = function() {
-          const checkedBoxes = document.querySelectorAll('.log-check:checked');
-          const ids = Array.from(checkedBoxes).map(cb => parseInt(cb.value));
-          if (ids.length === 0) return window.showToast('❌ 请先勾选日志', true);
+      // ✅ 新增：确认删除日志 (Modal 确定按钮调用)
+      window.confirmDeleteLog = async function() {
+          const id = window.CURRENT_LOG_ID_TO_DELETE;
+          if (id === null) return;
           
-          if(!confirm('确定要删除选中的 ' + ids.length + ' 条日志吗？')) return;
+          // 锁定按钮防止重复点击
+          const btn = document.querySelector('#logDeleteModal .bg-red-500');
+          const originalText = btn.innerText;
+          btn.innerText = '删除中...';
+          btn.disabled = true;
 
-          fetch(window.API_PREFIX + '/delete-logs', {
-            method: 'POST',
-            headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ ids: ids })
-            }).then(res => res.json()).then(data => {
-              if(data.status === 'success') {
-                  window.showToast('✅ 删除成功');
-                  window.fetchLogs(); // 刷新
-              } else {
-                  window.showToast('❌ 删除失败', true);
+          try {
+              // 复用删除接口，传入单元素数组
+              const res = await fetch(window.API_PREFIX + '/delete-logs', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ ids: [id] })
+              });
+              const data = await res.json();
+              if(data.status === 'success') { 
+                  window.showToast('✅ 删除成功'); 
+                  window.closeModal('logDeleteModal');
+                  // 从当前试图中移除
+                  if(window.ALL_LOGS) {
+                      window.ALL_LOGS = window.ALL_LOGS.filter(l => l.id !== id);
+                      window.filterLogs(); 
+                  } else {
+                      window.fetchLogs();
+                  }
+              } else { 
+                  window.showToast('❌ 删除失败', true); 
               }
-          }).catch(() => window.showToast('❌ 网络错误', true));
+          } catch(e) {
+              window.showToast('❌ 网络错误', true);
+          } finally {
+              // 恢复按钮状态
+              btn.innerText = originalText;
+              btn.disabled = false;
+              window.CURRENT_LOG_ID_TO_DELETE = null;
+          }
       }
 
-      // 5. 切换自定义天数输入框
       window.toggleCustomDays = function() {
           const val = document.getElementById('keep-days').value;
           const customInput = document.getElementById('custom-days-input');
@@ -3252,74 +3312,71 @@ pre,
           else customInput.classList.add('hidden');
       }
 
-      // 6. 删除旧日志 (按天数)
+      // ✅ 修复：不再使用丑陋的原生 confirm()，改为自定义弹窗
       window.deleteOldLogs = function() {
           let days = document.getElementById('keep-days').value;
           if (days === 'custom') {
               days = document.getElementById('custom-days-input').value;
               if (!days) return window.showToast('❌ 请输入天数', true);
           }
+          window.DAYS_TO_DELETE = days;
+          document.getElementById('days-to-delete-text').innerText = days;
+          window.openModal('confirmDeleteDaysModal');
+      }
+
+      // ✅ 新增：执行批量删除操作
+      window.confirmDeleteDaysAction = function() {
+          const days = window.DAYS_TO_DELETE;
+          if(!days) return;
           
-          if(!confirm('确定要删除 ' + days + ' 天前的所有日志吗？')) return;
+          const btn = document.querySelector('#confirmDeleteDaysModal .bg-red-500');
+          const originalText = btn.innerText;
+          btn.innerText = '清理中...';
+          btn.disabled = true;
 
           fetch(window.API_PREFIX + '/delete-logs', {
               method: 'POST',
               headers: {'Content-Type': 'application/json'},
               body: JSON.stringify({ days: days })
           }).then(res => res.json()).then(data => {
-              if(data.status === 'success') {
-                  window.showToast('✅ 清理成功');
-                  window.fetchLogs();
-              } else {
-                  window.showToast('❌ 清理失败', true);
-              }
-          }).catch(() => window.showToast('❌ 网络错误', true));
+              if(data.status === 'success') { 
+                  window.showToast('✅ 清理成功'); 
+                  window.closeModal('confirmDeleteDaysModal');
+                  window.fetchLogs(); // 刷新列表
+              } 
+              else { window.showToast('❌ 清理失败', true); }
+          }).catch(() => {
+              window.showToast('❌ 网络错误', true);
+          }).finally(() => {
+              btn.innerText = originalText;
+              btn.disabled = false;
+          });
       }
       
-      // 7. 通用执行占位符
-      window.performPendingAction = function() {
-          window.closeModal('universalConfirmModal');
-      }
+      window.performPendingAction = function() { window.closeModal('universalConfirmModal'); }
 
-      // --- [增强 v5.0] 查看日志逻辑 ---
       window.openLogsModal = function() {
           document.getElementById('logsModal').classList.add('open');
           window.fetchLogs();
       }
 
-      // [优化后的日志获取函数]
       window.fetchLogs = async function() {
           const tbody = document.getElementById('logs-table-body');
-          if (tbody) {
-              tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4">正在加载日志数据...</td></tr>';
-          }
-
+          if (tbody) { tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4">正在加载日志数据...</td></tr>'; }
           try {
               const res = await fetch(window.API_PREFIX + '/logs');
-
               if (res.status === 403) {
-                  if (tbody) {
-                      tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-red-500 font-bold">❌ 拒绝访问：您当前的 IP 不是管理员 IP，无法查看日志。</td></tr>';
-                  }
-                  window.ALL_LOGS = [];
-                  window.FILTERED_LOGS = [];
+                  if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-red-500 font-bold">❌ 拒绝访问</td></tr>';
                   return false;
               }
-
               const result = await res.json();
-
               if (res.ok && result.status === "success") {
                   const logs = result.data || [];
-
                   if (logs.length === 0) {
-                      if (tbody) {
-                          tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 opacity-60">暂无日志 (请检查 D1/KV 绑定是否正确，或尝试访问几次代理链接)</td></tr>';
-                      }
-                      window.ALL_LOGS = [];
-                      window.FILTERED_LOGS = [];
+                      if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 opacity-60">暂无日志</td></tr>';
+                      window.ALL_LOGS = []; window.FILTERED_LOGS = [];
                       return false;
                   }
-
                   window.ALL_LOGS = logs.map((l, index) => ({
                       id: (typeof l.id !== 'undefined') ? l.id : index,
                       time: l.time || l.created_at || '',
@@ -3331,44 +3388,28 @@ pre,
                       bytes: parseInt(l.bytes || '-1', 10),
                       cache_hit: l.cache_hit ? 1 : 0
                   }));
-
                   window.filterLogs();
                   window.showToast('✅ 日志已加载');
                   return true;
               } else {
-                  const errorMsg = result && result.data && result.data[0] && result.data[0].url ? result.data[0].url : '获取失败';
-                  if (tbody) {
-                      tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-red-500">' + errorMsg + '</td></tr>';
-                  }
-                  window.ALL_LOGS = [];
-                  window.FILTERED_LOGS = [];
+                  if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-red-500">获取失败</td></tr>';
                   return false;
               }
           } catch (e) {
-              console.error(e);
-              if (tbody) {
-                  tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-red-500">❌ 网络错误或数据库未连接</td></tr>';
-              }
-              window.ALL_LOGS = [];
-              window.FILTERED_LOGS = [];
+              if (tbody) tbody.innerHTML = '<tr><td colspan="7" class="text-center py-4 text-red-500">❌ 网络错误</td></tr>';
               return false;
           }
       }
 
-      // [新增] 导出 CSV
       window.exportLogsCsv = async function() {
           try {
               if (!window.ALL_LOGS || window.ALL_LOGS.length === 0) {
                   window.showToast('正在加载日志后导出...');
                   const ok = await window.fetchLogs();
-                  if (!ok) return window.showToast('❌ 没有可导出的日志（日志为空或加载失败）', true);
+                  if (!ok) return window.showToast('❌ 没有可导出的日志', true);
               }
-
               const rows = window.FILTERED_LOGS && window.FILTERED_LOGS.length > 0 ? window.FILTERED_LOGS : (window.ALL_LOGS || []);
-              if (!rows || rows.length === 0) return window.showToast('❌ 没有可导出的日志（过滤结果为空）', true);
-
               const header = ['id','time','status','ip','url','upstream','duration_ms','bytes','cache_hit'];
-
               const escapeCsv = function(v) {
                   const s = (v === null || v === undefined) ? '' : String(v);
                   if (s.includes('"') || s.includes(',') || s.includes('\\n') || s.includes('\\r')) {
@@ -3376,139 +3417,68 @@ pre,
                   }
                   return s;
               };
-
               let csv = header.join(',') + '\\n';
               for (let i = 0; i < rows.length; i++) {
                   const r = rows[i];
-                  const line = [
-                      r.id,
-                      r.time,
-                      r.status,
-                      r.ip,
-                      r.url,
-                      r.upstream,
-                      r.duration,
-                      r.bytes,
-                      r.cache_hit ? 1 : 0
-                  ].map(escapeCsv).join(',');
+                  const line = [r.id, r.time, r.status, r.ip, r.url, r.upstream, r.duration, r.bytes, r.cache_hit ? 1 : 0].map(escapeCsv).join(',');
                   csv += line + '\\n';
               }
-
               const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
               const u = URL.createObjectURL(blob);
               const a = document.createElement('a');
-              a.href = u;
-              a.download = 'access_logs.csv';
-              document.body.appendChild(a);
-              a.click();
-              document.body.removeChild(a);
-              URL.revokeObjectURL(u);
-
+              a.href = u; a.download = 'access_logs.csv';
+              document.body.appendChild(a); a.click(); document.body.removeChild(a); URL.revokeObjectURL(u);
               window.showToast('✅ CSV 已导出');
-          } catch (e) {
-              console.error(e);
-              window.showToast('❌ 导出失败', true);
-          }
+          } catch (e) { window.showToast('❌ 导出失败', true); }
       };
 
-      // [新增] 日志 UI 增强逻辑 (事件委托)
-      window.initLogsUiEnhancements = function() {
-          const tableBody = document.getElementById('logs-table-body');
-          if (!tableBody) return;
-
-          // 使用事件委托处理点击，避免改动 renderLogsTable
-          tableBody.addEventListener('click', function(e) {
-              // 寻找最近的 td 元素
-              const td = e.target.closest('td');
-              if (!td) return;
-              
-              // 忽略复选框列 (第一列)
-              if (td.classList.contains('check-col') || td.querySelector('input[type="checkbox"]')) return;
-
-              // [修正] 优先使用 textContent 获取完整文本，即使 CSS 做了截断
-              let fullText = td.getAttribute('title'); // 优先拿完整title
-              if (!fullText) fullText = td.textContent ? td.textContent.trim() : ''; // 拿纯文本
-              
-              // 如果内容太短，或者是 "-" 等无意义字符，不弹窗 (除非是 URL 列，URL 列总是值得查看)
-              // 简单的判断：如果内容长度超过 20 或者 包含 / 或 . 则认为是值得展示的
-              if (fullText && (fullText.length > 20 || fullText.includes('/') || fullText.includes('.'))) {
-                  const detailBox = document.getElementById('log-detail-modal-content');
-                  if (detailBox) {
-                      detailBox.textContent = fullText;
-                      window.openModal('logDetailModal');
-                  }
-              }
-          });
-      }; 
-
-      // [新增] 自定义时间 UI 初始化函数
-      window.initSignTtlUi = function() {
-          const select = document.getElementById('sign-ttl');
-          const container = document.getElementById('sign-custom-container');
-          if (!select || !container) return;
-
-          // 增强 Inputs: 纯数字模式
-          const inputs = container.querySelectorAll('input');
-          inputs.forEach(inp => {
-              inp.setAttribute('inputmode', 'numeric');
-              inp.setAttribute('type', 'number'); // 确保软键盘弹出数字
-              inp.setAttribute('pattern', '[0-9]*');
-              inp.setAttribute('min', '0');
-          });
-
-          // 监听 Select 变化
-          select.addEventListener('change', function() {
-              if (this.value === 'custom') {
-                  container.classList.add('sign-custom-open'); // 用于 CSS 钩子（如果需要额外动画）
-                  // 自动聚焦天数输入框
-                  setTimeout(() => {
-                      const daysInput = document.getElementById('ttl-days');
-                      if (daysInput) daysInput.focus();
-                  }, 50);
-              } else {
-                  container.classList.remove('sign-custom-open');
-              }
-          });
-      }; 
-
-      // ======================================================================
-      // ✅ 只把“初始化/绑定 DOM/恢复主题”等可能报错的逻辑放到 init 里
-      // ======================================================================
+      // --- Init ---
       (function initDashboard() {
           try {
-              console.log('Starting initDashboard...');
               const daemonJsonObj = { "registry-mirrors": ["https://" + window.CURRENT_DOMAIN] };
               daemonJsonStr = JSON.stringify(daemonJsonObj, null, 2);
               const daemonEl = document.getElementById('daemon-json-content');
               if (daemonEl) daemonEl.textContent = daemonJsonStr;
 
-              // Theme Init
               try { if (localStorage.getItem('theme') === 'dark') window.toggleTheme(); } catch(e) {}
-              
-              // I18N Init
-              try { 
-                  const savedLang = localStorage.getItem('lang') || 'zh';
-                  window.setLanguage(savedLang);
-              } catch(e) {}
+              try { const savedLang = localStorage.getItem('lang') || 'zh'; window.setLanguage(savedLang); } catch(e) {}
 
-              try {
-                  document.querySelectorAll('.modal-overlay').forEach(overlay => {
-                      overlay.addEventListener('click', function(e) {
-                          if (e.target === overlay) overlay.classList.remove('open');
-                      });
+              // Modal Close Events
+              document.querySelectorAll('.modal-overlay').forEach(overlay => {
+                  overlay.addEventListener('click', function(e) {
+                      if (e.target === overlay) overlay.classList.remove('open');
                   });
-              } catch (e) {}
-              console.log('initDashboard finished.');
+              });
               
-              // [新增] 启动日志 UI 增强
-              if (window.initLogsUiEnhancements) window.initLogsUiEnhancements();
+              // Log Detail UI (Access Logs)
+              const tableBody = document.getElementById('logs-table-body');
+              if (tableBody) {
+                  tableBody.addEventListener('click', function(e) {
+                      // 寻找点击所在的 td
+                      const td = e.target.closest('td');
+                      if (!td) return;
+                      
+                      // 检查是否是操作按钮列
+                      if (e.target.closest('button') || e.target.tagName === 'BUTTON') { 
+                          return;
+                      }
+
+                      let fullText = td.getAttribute('title'); 
+                      if (!fullText) fullText = td.textContent ? td.textContent.trim() : ''; 
+                      if (fullText && (fullText.length > 20 || fullText.includes('/') || fullText.includes('.'))) {
+                          const detailBox = document.getElementById('log-detail-modal-content');
+                          if (detailBox) {
+                              detailBox.textContent = fullText;
+                              window.openModal('logDetailModal');
+                          }
+                      }
+                  });
+              }
               
-              // [新增] 启动自定义时间 UI 增强
-              if (window.initSignTtlUi) window.initSignTtlUi();
-          } catch (e) {
-              console.error('Dashboard init error:', e);
-              window.showToast('❌ Dashboard 初始化失败，请打开控制台查看错误', true);
-          }
+              // [新增] 自动加载链接列表 (如果有权限)
+              if (document.getElementById('links-tbody')) { window.loadLinks(); }
+
+          } catch (e) { console.error('Dashboard init error:', e); window.showToast('❌ Dashboard 初始化失败', true); }
       })();
     </script>
 </body>
