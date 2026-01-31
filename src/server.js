@@ -1,12 +1,13 @@
 /**
  * -----------------------------------------------------------------------------------------
  * ProxyX Application (VPS Node.js Edition)
- * 版本: v5.3.0 (Sync with Cloudflare Worker v5.3.0)
+ * 版本: v5.4.0 (Sync with Cloudflare Worker v5.3.0 Logic)
  * -----------------------------------------------------------------------------------------
  * 核心功能：
- * 1. 完美复刻 Worker v5.3.0 所有逻辑 (Random Camo, HMAC, Deep Audit)。
+ * 1. 完美复刻 Worker v5.3.0 所有逻辑 (Random Camo, HMAC, Deep Audit, S3 Blob Proxy)。
  * 2. 使用 SQLite (better-sqlite3) 替代 Cloudflare D1/KV。
  * 3. 使用 node-cache 替代 Cloudflare Cache API。
+ * 4. 增加了对 Docker Library 命名空间的自动补全和 302 跳转处理。
  * -----------------------------------------------------------------------------------------
  */
 
@@ -32,6 +33,7 @@ if (fs.existsSync(envPath)) {
 }
 
 const app = express();
+// 默认缓存 1 小时
 const cacheTTL = parseInt(process.env.CACHE_TTL || "3600");
 const myCache = new NodeCache({ stdTTL: cacheTTL }); 
 const PORT = process.env.PORT || 21011; 
@@ -45,6 +47,7 @@ const dbPath = path.join(dataDir, 'proxyx.db');
 const db = new Database(dbPath);
 
 // 初始化表结构 (同步 Worker v5.3.0 Schema)
+// 包含 ip_limits(限额), access_logs(日志), shared_links(免密链接)
 db.exec(`
   CREATE TABLE IF NOT EXISTS ip_limits (
     ip TEXT NOT NULL, date TEXT NOT NULL, count INTEGER DEFAULT 0, updated_at INTEGER, PRIMARY KEY (ip, date)
@@ -57,11 +60,12 @@ db.exec(`
     id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT UNIQUE, target TEXT, 
     exp INTEGER, note TEXT, created_at TEXT, visit_count INTEGER DEFAULT 0
   );
+  CREATE INDEX IF NOT EXISTS idx_access_logs_created_at ON access_logs(created_at);
 `);
 
 // 预编译 SQL (适配 Worker 逻辑)
 const stmts = {
-    // IP Limits
+    // --- IP Limits ---
     getLimit: db.prepare('SELECT count FROM ip_limits WHERE ip = ? AND date = ?'),
     upsertLimit: db.prepare(`INSERT INTO ip_limits (ip, date, count, updated_at) VALUES (@ip, @date, 1, @time) ON CONFLICT(ip, date) DO UPDATE SET count = count + 1, updated_at = @time`),
     resetIp: db.prepare('DELETE FROM ip_limits WHERE ip = ? AND date = ?'),
@@ -69,13 +73,13 @@ const stmts = {
     getStats: db.prepare('SELECT ip, count FROM ip_limits WHERE date = ? ORDER BY count DESC LIMIT 100'),
     getStatsSum: db.prepare('SELECT SUM(count) as total, COUNT(*) as unique_ips FROM ip_limits WHERE date = ?'),
     
-    // Logs
+    // --- Logs ---
     insertLog: db.prepare(`INSERT INTO access_logs (ip, url, created_at, status, upstream, duration, bytes, cache_hit) VALUES (@ip, @url, @created_at, @status, @upstream, @duration, @bytes, @cache_hit)`),
     getLogs: db.prepare('SELECT * FROM access_logs ORDER BY id DESC LIMIT 500'),
     deleteLogsByDate: db.prepare("DELETE FROM access_logs WHERE created_at < datetime('now', '-' || ? || ' days', 'localtime')"),
     resetAllLogs: db.prepare('DELETE FROM access_logs'),
     
-    // Links (v5.3 新增)
+    // --- Links (v5.3 新增) ---
     getLinkByKey: db.prepare('SELECT * FROM shared_links WHERE key = ?'),
     updateLinkVisit: db.prepare('UPDATE shared_links SET visit_count = visit_count + 1 WHERE id = ?'),
     createLink: db.prepare('INSERT INTO shared_links (key, target, exp, note, created_at) VALUES (@key, @target, @exp, @note, @created_at)'),
@@ -105,16 +109,32 @@ const CONFIG = {
     FREE_PATHS: parseList(process.env.FREE_PATHS, "ubuntu,debian,centos,rockylinux,almalinux,fedora,alpine,kali,termux"),
     ADMIN_IPS: parseList(process.env.ADMIN_IPS, "127.0.0.1"),
     IP_LIMIT_WHITELIST: parseList(process.env.IP_LIMIT_WHITELIST, "127.0.0.1"),
+    
+    // [v5.3 新增] HMAC 签名密钥
     SIGN_SECRET: process.env.SIGN_SECRET || "change-me-to-a-secure-random-string",
     
-    // 伪装相关配置 (完全同步 Worker)
+    // [v5.3 新增] 伪装相关配置 (完全同步 Worker)
     CAMOUFLAGE_URLS: parseList(process.env.CAMOUFLAGE_URL, "blog.spacenb.com,blog.2055555.xyz,www.baidu.com,www.bing.com"),
     CAMOUFLAGE_MODE: (process.env.CAMOUFLAGE_MODE || "random").toLowerCase(),
 };
 
-// Docker & Linux Maps (保持不变)
-const REGISTRY_MAP = { 'ghcr.io': 'https://ghcr.io', 'quay.io': 'https://quay.io', 'gcr.io': 'https://gcr.io', 'k8s.gcr.io': 'https://k8s.gcr.io', 'registry.k8s.io': 'https://registry.k8s.io', 'docker.cloudsmith.io': 'https://docker.cloudsmith.io', 'nvcr.io': 'https://nvcr.io', 'mcr.microsoft.com': 'https://mcr.microsoft.com', 'public.ecr.aws': 'https://public.ecr.aws', 'registry.gitlab.com': 'https://registry.gitlab.com', 'ccr.ccs.tencentyun.com': 'https://ccr.ccs.tencentyun.com', 'registry.cn-hangzhou.aliyuncs.com': 'https://registry.cn-hangzhou.aliyuncs.com', 'docker.elastic.co': 'https://docker.elastic.co' };
-const LINUX_MIRRORS = { 'ubuntu': 'http://archive.ubuntu.com/ubuntu', 'ubuntu-security': 'http://security.ubuntu.com/ubuntu', 'debian': 'http://deb.debian.org/debian', 'debian-security': 'http://security.debian.org/debian-security', 'centos': 'https://vault.centos.org', 'centos-stream': 'http://mirror.stream.centos.org', 'rockylinux': 'https://download.rockylinux.org/pub/rocky', 'almalinux': 'https://repo.almalinux.org/almalinux', 'fedora': 'https://download.fedoraproject.org/pub/fedora/linux', 'alpine': 'http://dl-cdn.alpinelinux.org/alpine', 'kali': 'http://http.kali.org/kali', 'archlinux': 'https://geo.mirror.pkgbuild.com', 'termux': 'https://packages.termux.org/apt/termux-main' };
+// Docker & Linux Maps (同步 Worker v5.3.0 列表)
+const REGISTRY_MAP = { 
+    'ghcr.io': 'https://ghcr.io', 'quay.io': 'https://quay.io', 'gcr.io': 'https://gcr.io', 
+    'k8s.gcr.io': 'https://k8s.gcr.io', 'registry.k8s.io': 'https://registry.k8s.io', 
+    'docker.cloudsmith.io': 'https://docker.cloudsmith.io', 'nvcr.io': 'https://nvcr.io', 
+    'mcr.microsoft.com': 'https://mcr.microsoft.com', 'public.ecr.aws': 'https://public.ecr.aws', 
+    'registry.gitlab.com': 'https://registry.gitlab.com', 'ccr.ccs.tencentyun.com': 'https://ccr.ccs.tencentyun.com', 
+    'registry.cn-hangzhou.aliyuncs.com': 'https://registry.cn-hangzhou.aliyuncs.com', 'docker.elastic.co': 'https://docker.elastic.co' 
+};
+const LINUX_MIRRORS = { 
+    'ubuntu': 'http://archive.ubuntu.com/ubuntu', 'ubuntu-security': 'http://security.ubuntu.com/ubuntu', 
+    'debian': 'http://deb.debian.org/debian', 'debian-security': 'http://security.debian.org/debian-security', 
+    'centos': 'https://vault.centos.org', 'centos-stream': 'http://mirror.stream.centos.org', 
+    'rockylinux': 'https://download.rockylinux.org/pub/rocky', 'almalinux': 'https://repo.almalinux.org/almalinux', 
+    'fedora': 'https://download.fedoraproject.org/pub/fedora/linux', 'alpine': 'http://dl-cdn.alpinelinux.org/alpine', 
+    'kali': 'http://http.kali.org/kali', 'archlinux': 'https://geo.mirror.pkgbuild.com', 'termux': 'https://packages.termux.org/apt/termux-main' 
+};
 const LIGHTNING_SVG = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M13 2L3 14H12L11 22L21 10H12L13 2Z" stroke="#F59E0B" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 
 // ==============================================================================
@@ -124,7 +144,7 @@ const getClientIP = (req) => (req.headers['cf-connecting-ip'] || req.headers['x-
 const getDate = () => new Date(new Date().getTime() + 28800000).toISOString().split('T')[0];
 const getTime = () => new Date(new Date().getTime() + 28800000).toISOString().replace('T', ' ').substring(0, 19);
 
-// 核心逻辑函数：洗牌算法
+// [核心] 洗牌算法：用于随机选择伪装地址
 const pickCamouflageOrder = (urls, mode) => {
     const list = [...urls];
     if (list.length <= 1) return list;
@@ -137,7 +157,7 @@ const pickCamouflageOrder = (urls, mode) => {
     return list;
 };
 
-// 核心逻辑函数：统一伪装请求 (包含禁用缓存修复)
+// [核心] 统一伪装请求：处理 headers 和 禁用缓存
 const tryCamouflage = async (req, res) => {
     const urls = CONFIG.CAMOUFLAGE_URLS || [];
     if (!urls.length) return null;
@@ -154,7 +174,8 @@ const tryCamouflage = async (req, res) => {
             const headers = { ...req.headers };
             headers['Host'] = targetUrl.hostname;
             headers['Referer'] = targetUrl.origin;
-            headers['User-Agent'] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+            headers['User-Agent'] = req.headers['user-agent'] || "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+            // 删除可能暴露代理的头
             delete headers['cf-connecting-ip']; delete headers['cf-worker']; delete headers['x-forwarded-for']; delete headers['cookie'];
 
             const camoRes = await fetch(targetUrl.toString(), {
@@ -167,13 +188,13 @@ const tryCamouflage = async (req, res) => {
             const outHeaders = {};
             camoRes.headers.forEach((v, k) => {
                 const lowKey = k.toLowerCase();
-                if (lowKey !== 'content-security-policy' && lowKey !== 'x-frame-options' 
-                    && lowKey !== 'content-encoding' && lowKey !== 'content-length' && lowKey !== 'transfer-encoding') {
+                // 过滤掉不可用的安全头和压缩头
+                if (!['content-security-policy', 'x-frame-options', 'content-encoding', 'content-length', 'transfer-encoding'].includes(lowKey)) {
                     outHeaders[k] = v;
                 }
             });
             
-            // [关键] 强制禁用缓存
+            // [关键] 强制禁用伪装页面的缓存
             outHeaders['Cache-Control'] = "no-store, no-cache, must-revalidate, proxy-revalidate";
             outHeaders['Pragma'] = "no-cache";
             outHeaders['Expires'] = "0";
@@ -189,13 +210,22 @@ const tryCamouflage = async (req, res) => {
     return null;
 };
 
-// HMAC (Node.js 原生)
-const verifyHmac = (secret, message, sigHex) => {
-    try { const hmac = crypto.createHmac('sha256', secret); hmac.update(message); return hmac.digest('hex') === sigHex; } catch (e) { return false; }
+// [新增] HMAC 签名与验证 (Node.js crypto 实现)
+const generateHmac = (secret, message) => { 
+    const hmac = crypto.createHmac('sha256', secret); 
+    hmac.update(message); 
+    return hmac.digest('hex'); 
 };
-const generateHmac = (secret, message) => { const hmac = crypto.createHmac('sha256', secret); hmac.update(message); return hmac.digest('hex'); };
 
-// Log & Limit
+const verifyHmac = (secret, message, sigHex) => {
+    try { 
+        const expected = generateHmac(secret, message);
+        // 使用 timingSafeEqual 防止时序攻击
+        return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sigHex));
+    } catch (e) { return false; }
+};
+
+// Log & Limit 封装
 const chargeRequest = (ip) => {
     if (CONFIG.IP_LIMIT_WHITELIST.includes(ip)) return;
     try { stmts.upsertLimit.run({ ip, date: getDate(), time: Date.now() }); } catch (e) {}
@@ -232,7 +262,9 @@ app.use((req, res, next) => {
 
 app.use((req, res, next) => {
     const ip = getClientIP(req);
+    // IP 白名单
     if (CONFIG.ALLOW_IPS.length > 0 && !CONFIG.ALLOW_IPS.includes(ip)) return res.status(403).send(`Access Denied (IP ${ip})`);
+    // 地区限制 (使用 geoip-lite)
     if (CONFIG.ALLOW_COUNTRIES.length > 0) {
         if (ip === '127.0.0.1' || ip.startsWith('192.168.') || ip.startsWith('10.')) return next();
         const geo = geoip.lookup(ip);
@@ -244,17 +276,21 @@ app.use((req, res, next) => {
 
 app.use(checkRateLimit);
 app.use(express.raw({ type: '*/*', limit: '50mb' }));
+app.use(express.json()); // 用于 Admin API 的 JSON 解析
 
 // --- Routes ---
 app.get('/robots.txt', (req, res) => res.type('text/plain').send("User-agent: *\nDisallow: /"));
 app.get('/favicon.ico', (req, res) => res.type('image/svg+xml').send(LIGHTNING_SVG));
 
-// Token
+// --- Docker Token ---
 app.get('/token', async (req, res) => {
     const scope = req.query.scope;
     let upstream = 'https://auth.docker.io/token';
+    // 自动判断上游 Registry
     for (const [d, _] of Object.entries(REGISTRY_MAP)) if (scope && scope.includes(d)) { upstream = `https://${d}/token`; break; }
     const newUrl = new URL(upstream); newUrl.search = new URLSearchParams(req.query).toString();
+    
+    // Docker Hub 自动补全 library/ 逻辑
     if (upstream === 'https://auth.docker.io/token') {
         newUrl.searchParams.set('service', 'registry.docker.io');
         if (scope && scope.startsWith('repository:')) {
@@ -271,12 +307,14 @@ app.get('/token', async (req, res) => {
     } catch (e) { res.status(500).send(e.message); }
 });
 
-// Docker V2
+// --- Docker V2 API (增强版：支持 Blob S3 跳转) ---
 app.use('/v2', async (req, res) => {
-    const start = Date.now(); const ip = getClientIP(req);
+    const start = Date.now(); 
+    const ip = getClientIP(req);
     const isDockerCharge = (req.path.includes("/manifests/") || req.path.includes("/blobs/")) && req.method === "GET";
     const cacheKey = `dedup:${ip}:${req.originalUrl}`;
     
+    // Dedup 逻辑
     if (isDockerCharge && !CONFIG.IP_LIMIT_WHITELIST.includes(ip) && !myCache.get(cacheKey)) {
         chargeRequest(ip);
         myCache.set(cacheKey, 1, 5); // 5s dedup
@@ -285,6 +323,7 @@ app.use('/v2', async (req, res) => {
     let path = req.path === '/' ? '' : req.path;
     let domain = 'registry-1.docker.io'; let upstream = 'https://registry-1.docker.io';
 
+    // 根目录连通性检查
     if (path === '') {
         try {
             const r = await fetch(upstream + '/v2/', { method: req.method, headers: req.headers });
@@ -297,6 +336,7 @@ app.use('/v2', async (req, res) => {
         } catch(e) { return res.status(500).send(e.message); }
     }
 
+    // 路径解析与 library/ 补全
     const parts = path.replace(/^\//, '').split('/');
     if (REGISTRY_MAP[parts[0]]) { domain = parts[0]; upstream = REGISTRY_MAP[parts[0]]; path = '/' + parts.slice(1).join('/'); }
     else if (domain === 'registry-1.docker.io') {
@@ -311,19 +351,35 @@ app.use('/v2', async (req, res) => {
     delete headers['host']; delete headers['connection'];
 
     try {
-        const resp = await fetch(targetUrl, { method: req.method, headers: headers, body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body, redirect: 'manual' });
+        // [关键] redirect: 'manual' 用于手动处理 S3 的 302/307 跳转
+        const resp = await fetch(targetUrl, { 
+            method: req.method, 
+            headers: headers, 
+            body: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body, 
+            redirect: 'manual' 
+        });
+
+        // 处理 401
         if (resp.status === 401) {
             const auth = resp.headers.get('WWW-Authenticate');
             if (auth) res.setHeader('WWW-Authenticate', auth.replace(/realm="([^"]+)"/, `realm="${req.protocol}://${req.get('host')}/token"`));
             res.status(401); const body = await resp.text(); res.send(body);
             logRequest(ip, req.originalUrl, 401, domain, Date.now() - start, body.length, false); return;
         }
+
+        // 处理 302/307 Blob 重定向 (S3 下载)
         if ([301, 302, 307, 308].includes(resp.status) && resp.headers.get('Location')) {
-            const blob = await fetch(resp.headers.get('Location'), { method: 'GET', headers: { 'User-Agent': 'Docker-Client/24.0.5 (linux)' } });
-            res.status(blob.status); blob.headers.forEach((v, k) => { if(k!=='content-encoding' && k!=='transfer-encoding') res.setHeader(k, v); });
+            const blobUrl = resp.headers.get('Location');
+            const blobHeaders = { 'User-Agent': 'Docker-Client/24.0.5 (linux)' };
+            if (req.headers['range']) blobHeaders['Range'] = req.headers['range']; // 支持断点续传
+
+            const blob = await fetch(blobUrl, { method: 'GET', headers: blobHeaders });
+            res.status(blob.status); 
+            blob.headers.forEach((v, k) => { if(k!=='content-encoding' && k!=='transfer-encoding') res.setHeader(k, v); });
             const buf = await blob.arrayBuffer(); res.send(Buffer.from(buf));
             logRequest(ip, req.originalUrl, blob.status, "BlobS3", Date.now() - start, buf.byteLength, false); return;
         }
+
         res.status(resp.status); resp.headers.forEach((v, k) => res.setHeader(k, v));
         const buf = await resp.arrayBuffer(); res.send(Buffer.from(buf));
         logRequest(ip, req.originalUrl, resp.status, domain, Date.now() - start, buf.byteLength, false);
@@ -333,26 +389,34 @@ app.use('/v2', async (req, res) => {
     }
 });
 
-// --- Main Handler ---
+// --- Main Handler (General Proxy / Admin / Linux / Dashboard) ---
 app.all('*', async (req, res) => {
     const start = Date.now(); const ip = getClientIP(req); const path = req.path;
     const isAdmin = CONFIG.ADMIN_IPS.includes(ip);
     
+    // 权限与信任检查
     let isTrusted = isAdmin || CONFIG.IP_LIMIT_WHITELIST.includes(ip);
+    // Referer 免密 (多规则支持)
     if (!isTrusted && CONFIG.ALLOW_REFERER) {
         const ref = req.headers['referer'] || "";
         const rules = CONFIG.ALLOW_REFERER.split(/[\n,]/).map(s=>s.trim()).filter(s=>s);
-        for(const r of rules) if(r.includes("://") ? ref.startsWith(r) : ref.includes(r)) { isTrusted = true; break; }
+        let refUrl; try { refUrl = new URL(ref); } catch(e){}
+        if (refUrl) {
+            for(const r of rules) {
+                if(r.includes("://") ? ref.startsWith(r) : (refUrl.hostname === r || refUrl.hostname.endsWith("." + r))) { isTrusted = true; break; }
+            }
+        }
     }
-    if (!isTrusted && CONFIG.ALLOW_USER_AGENT && (req.headers['user-agent']||"").includes(CONFIG.ALLOW_USER_AGENT)) isTrusted = true;
+    // UA 免密
+    if (!isTrusted && CONFIG.ALLOW_USER_AGENT && (req.headers['user-agent']||"").toLowerCase().includes(CONFIG.ALLOW_USER_AGENT.toLowerCase())) isTrusted = true;
 
     let subPath = "", isAuth = false, isHmac = false;
     
-    // HMAC & Link Check
+    // --- Link Check (/s/) ---
     if (path.startsWith('/s/')) {
-        const parts = path.split('/').filter(p=>p);
-        // 1. Database Links
-        if (parts.length >= 1) {
+        const parts = path.split('/').filter(p=>p); // ['', 's', 'part2', ...]
+        // 1. Database Links: /s/<key>
+        if (parts.length >= 2 && parts[0] === 's') {
              const key = parts[1];
              try {
                  const link = stmts.getLinkByKey.get(key);
@@ -361,26 +425,30 @@ app.all('*', async (req, res) => {
                      if(link.exp === 0 || link.exp > now) {
                          isAuth = true; subPath = link.target; isTrusted = true; isHmac = true;
                          stmts.updateLinkVisit.run(link.id);
+                     } else {
+                         return res.status(410).send("Link Expired");
                      }
                  }
              } catch(e) {}
         }
-        // 2. Stateless HMAC
+        // 2. Stateless HMAC: /s/<exp>/<sig>/<target>
         if (!isAuth && parts.length >= 4) {
              const exp = parts[1]; const sig = parts[2]; const target = parts.slice(3).join('/');
-             if (parseInt(exp) > Date.now()/1000 && verifyHmac(CONFIG.SIGN_SECRET, `${exp}\n${target}`, sig)) {
+             const now = Math.floor(Date.now()/1000);
+             if (parseInt(exp) > now && verifyHmac(CONFIG.SIGN_SECRET, `${exp}\n${target}`, sig)) {
                  isAuth = true; subPath = target; isTrusted = true; isHmac = true;
              }
         }
     } else {
+        // 标准密码验证
         const match = path.match(/^\/([^/]+)(?:\/(.*))?$/);
         if (match && match[1] === CONFIG.PASSWORD) { isAuth = true; subPath = match[2] || ""; }
         else if (isTrusted) { isAuth = true; subPath = path.substring(1); }
     }
 
-    // --- Camouflage (Random + Fix) ---
+    // --- 伪装逻辑 (Camouflage) ---
     if (!isAuth) {
-        const camo = await tryCamouflage(req);
+        const camo = await tryCamouflage(req, res);
         if (camo) {
             res.status(camo.status);
             Object.keys(camo.headers).forEach(k => res.setHeader(k, camo.headers[k]));
@@ -401,17 +469,23 @@ app.all('*', async (req, res) => {
         return res.json({status:"success", data:{totalRequests:sum.total||0, uniqueIps:sum.unique_ips||0, details:rows}}); 
     }
     if (subPath === "logs") { if(!isAdmin) return res.status(403).send("Forbidden"); return res.json({status:"success", data:stmts.getLogs.all()}); }
+    
+    // 日志删除 (List or Date)
     if (subPath === "delete-logs") { 
         if(!isAdmin) return res.status(403).send("Forbidden"); 
-        const body = await new Promise(r=>{let d='';req.on('data',c=>d+=c);req.on('end',()=>r(JSON.parse(d||'{}')))});
-        if(body.ids) { const ids = body.ids.map(i=>parseInt(i)).filter(i=>!isNaN(i)).join(','); if(ids) db.prepare(`DELETE FROM access_logs WHERE id IN (${ids})`).run(); }
+        const body = req.body;
+        if(body.ids && Array.isArray(body.ids)) { 
+            const ids = body.ids.map(i=>parseInt(i)).filter(i=>!isNaN(i)).join(','); 
+            if(ids) db.prepare(`DELETE FROM access_logs WHERE id IN (${ids})`).run(); 
+        }
         else if(body.days) stmts.deleteLogsByDate.run(body.days);
         return res.json({status:"success"});
     }
-    // Link Manager API
+    
+    // 链接管理 API
     if (subPath === "admin/links/create") {
          if(!isAdmin) return res.status(403).send("Forbidden");
-         const body = await new Promise(r=>{let d='';req.on('data',c=>d+=c);req.on('end',()=>r(JSON.parse(d||'{}')))});
+         const body = req.body;
          const key = crypto.randomBytes(32).toString('hex');
          const now = Math.floor(Date.now()/1000);
          const exp = (body.seconds && parseInt(body.seconds) > 0) ? (now + parseInt(body.seconds)) : 0;
@@ -424,35 +498,49 @@ app.all('*', async (req, res) => {
     }
     if (subPath === "admin/links/delete") {
          if(!isAdmin) return res.status(403).send("Forbidden");
-         const body = await new Promise(r=>{let d='';req.on('data',c=>d+=c);req.on('end',()=>r(JSON.parse(d||'{}')))});
-         stmts.deleteLink.run(body.id);
+         stmts.deleteLink.run(req.body.id);
          return res.json({status:"success"});
+    }
+    // 签名生成 API
+    if (subPath === "sign-url") {
+        if(!isAdmin) return res.status(403).send("Forbidden");
+        const { target, seconds } = req.body;
+        const exp = Math.floor(Date.now()/1000) + (parseInt(seconds) || 3600);
+        const sig = generateHmac(CONFIG.SIGN_SECRET, `${exp}\n${target}`);
+        return res.json({status:"success", url: `/s/${exp}/${sig}/${target}`});
     }
 
     // Dashboard
     if (!subPath) {
         let count = 0; try { const r = stmts.getLimit.get(ip, getDate()); if(r) count=r.count; } catch(e){}
+        // 这里返回您的 UI HTML 代码 (已省略，请粘贴您原有的 renderDashboard 函数内容)
         return res.send(renderDashboard(req.hostname, CONFIG.PASSWORD, ip, count, CONFIG.DAILY_LIMIT_COUNT, CONFIG.ADMIN_IPS));
     }
 
-    // Proxy
-    let finalUpstream = "", bytes = 0, isCache = false;
+    // --- Proxy Logic ---
+    let finalUpstream = "", bytes = 0;
     const cleanSub = subPath.replace(/^\//,'');
     const isFree = CONFIG.FREE_PATHS.some(fp => cleanSub.startsWith(fp));
-    if (!isFree) {
+    
+    // 限额扣费
+    if (!isFree && !isTrusted) {
         const cacheKey = `dedup:${ip}:${req.originalUrl}`;
         if (!myCache.get(cacheKey)) { chargeRequest(ip); myCache.set(cacheKey, 1, 5); }
     }
 
-    // Linux
+    // 1. Linux 镜像源加速
     const linuxDistro = Object.keys(LINUX_MIRRORS).sort((a,b)=>b.length-a.length).find(k => subPath.startsWith(k+'/') || subPath === k);
     if (linuxDistro) {
         const up = LINUX_MIRRORS[linuxDistro]; finalUpstream = up;
         const target = up.endsWith('/') ? up + subPath.replace(linuxDistro,'').replace(/^\//,'') : up + '/' + subPath.replace(linuxDistro,'').replace(/^\//,'');
         try {
-            const headers = {...req.headers}; delete headers['host'];
+            const headers = {...req.headers}; delete headers['host']; delete headers['cf-connecting-ip'];
+            if(req.headers['range']) headers['Range'] = req.headers['range']; // 支持断点续传
+
             const r = await fetch(target, { method: req.method, headers: headers, redirect: 'follow' });
-            res.status(r.status); r.headers.forEach((v,k)=>res.setHeader(k,v));
+            res.status(r.status); 
+            r.headers.forEach((v,k)=>res.setHeader(k,v));
+            
             const buf = await r.arrayBuffer(); bytes = buf.byteLength;
             res.send(Buffer.from(buf));
             logRequest(ip, req.originalUrl, r.status, up, Date.now()-start, bytes, false);
@@ -460,7 +548,7 @@ app.all('*', async (req, res) => {
         } catch(e) { res.status(502).send(e.message); logRequest(ip, req.originalUrl, 502, up, Date.now()-start, 0, false); return; }
     }
 
-    // General
+    // 2. 通用代理 (Raw / Recursive)
     let mode = 'raw'; let targetStr = subPath;
     if (subPath.startsWith('rt/') || subPath === 'rt') { mode = 'recursive_text'; targetStr = subPath.replace(/^rt\/?/, ""); }
     else if (subPath.startsWith('r/') || subPath === 'r') { mode = 'recursive_all'; targetStr = subPath.replace(/^r\/?/, ""); }
@@ -475,6 +563,7 @@ app.all('*', async (req, res) => {
     } catch(e) { return res.status(400).send("Invalid URL"); }
 
     const cacheKey = req.originalUrl;
+    // 递归模式启用缓存
     if ((mode!=='raw') && CONFIG.ENABLE_CACHE) {
         const cached = myCache.get(cacheKey);
         if(cached) { 
@@ -484,41 +573,66 @@ app.all('*', async (req, res) => {
     }
 
     try {
-        const headers = {...req.headers}; delete headers['host']; delete headers['connection'];
+        const headers = {...req.headers}; 
+        delete headers['host']; delete headers['connection']; delete headers['cookie'];
         if (!headers['user-agent']) headers['user-agent'] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36";
-        const r = await fetch(targetStr, { method: req.method, headers: headers, body: ['GET','HEAD'].includes(req.method)?undefined:req.body, redirect: 'follow' });
-        
-        res.status(r.status);
-        r.headers.forEach((v,k) => { if((mode!=='raw') && ['content-encoding','content-length','transfer-encoding'].includes(k)) return; res.setHeader(k,v); });
+        headers['Referer'] = targetStr;
+
+        // 手动处理重定向以防止死循环
+        let redirectCount = 0; let finalResponse = null; let currentUrl = targetStr;
+        while(redirectCount < CONFIG.MAX_REDIRECTS) {
+             const r = await fetch(currentUrl, { method: req.method, headers: headers, body: ['GET','HEAD'].includes(req.method)?undefined:req.body, redirect: 'manual' });
+             if([301,302,303,307,308].includes(r.status)) {
+                 const loc = r.headers.get('Location');
+                 if(loc) { currentUrl = new URL(loc, currentUrl).href; redirectCount++; continue; }
+             }
+             finalResponse = r; break;
+        }
+        if(!finalResponse) throw new Error("Too many redirects");
+
+        res.status(finalResponse.status);
+        finalResponse.headers.forEach((v,k) => { 
+            if((mode!=='raw') && ['content-encoding','content-length','transfer-encoding', 'content-disposition'].includes(k)) return; 
+            res.setHeader(k,v); 
+        });
         if(isAdmin) { res.setHeader('X-Debug-Upstream', finalUpstream); res.setHeader('X-Debug-Duration', (Date.now()-start)+'ms'); }
 
+        // Raw 模式：二进制透传
         if (mode === 'raw') {
-            const buf = await r.arrayBuffer(); bytes = buf.byteLength;
+            const buf = await finalResponse.arrayBuffer(); bytes = buf.byteLength;
             res.send(Buffer.from(buf));
         } else {
-            let text = await r.text();
-            if (mode === 'recursive_text' && !((r.headers.get("content-type")||"").includes("text/") || (r.headers.get("content-type")||"").includes("json"))) {
-                res.send(text);
+            // Recursive 模式：内容重写
+            const contentType = (finalResponse.headers.get("content-type")||"").toLowerCase();
+            let shouldRewrite = true;
+            if (mode === 'recursive_text') shouldRewrite = contentType.includes("text/") || contentType.includes("json") || contentType.includes("xml") || contentType.includes("javascript");
+
+            if (!shouldRewrite) {
+                 const buf = await finalResponse.arrayBuffer(); bytes = buf.byteLength; res.send(Buffer.from(buf));
             } else {
+                let text = await finalResponse.text();
                 const origin = `${req.protocol}://${req.get('host')}`;
-                const base = `${origin}/${CONFIG.PASSWORD}/${mode === 'rt' ? 'rt' : 'r'}/`;
-                text = text.replace(/(https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))/g, m => m.includes(origin) ? m : base + m);
-                if (mode === 'recursive_text' && (r.headers.get("content-type")||"").includes("html")) {
-                    text = text.replace(/(href|src|action)=["'](\/[^"']+)["']/g, (m,a,p) => `${a}="${base}${new URL(targetStr).origin}${p}"`);
+                const proxyBase = `${origin}/${CONFIG.PASSWORD}/${mode === 'recursive_text' ? 'rt' : 'r'}/`;
+                
+                // 1. 绝对路径替换
+                text = text.replace(/(https?:\/\/[a-zA-Z0-9][-a-zA-Z0-9@:%._\+~#=]{1,256}\.[a-zA-Z0-9()]{1,6}\b([-a-zA-Z0-9()@:%_\+.~#?&//=]*))/g, m => m.includes(origin) ? m : proxyBase + m);
+                // 2. HTML 相对路径替换
+                if (contentType.includes("html")) {
+                    const currentBase = new URL(currentUrl).origin;
+                    text = text.replace(/(href|src|action)=["'](\/[^"']+)["']/g, (m,a,p) => `${a}="${proxyBase}${currentBase}${p}"`);
                 }
+                
                 bytes = Buffer.byteLength(text);
-                if(CONFIG.ENABLE_CACHE && r.status===200) myCache.set(cacheKey, text);
+                if(CONFIG.ENABLE_CACHE && finalResponse.status===200) myCache.set(cacheKey, text);
                 res.send(text);
             }
         }
-        logRequest(ip, req.originalUrl, r.status, finalUpstream, Date.now()-start, bytes, false);
+        logRequest(ip, req.originalUrl, finalResponse.status, finalUpstream, Date.now()-start, bytes, false);
     } catch(e) { 
         res.status(502).send(e.message); 
         logRequest(ip, req.originalUrl, 502, finalUpstream, Date.now()-start, 0, false); 
     }
 });
-
-app.listen(PORT, () => { console.log(`ProxyX Server running on port ${PORT}`); });
 
 // ==============================================================================
 // 4. Dashboard 渲染 (UI 界面 - 修复层级与弹窗美化版)
