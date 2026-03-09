@@ -27,126 +27,201 @@
 // ==============================================================================
 
 const DEFAULT_CONFIG = {
-    // --- 基础配置 ---
-    PASSWORD: "123456",               // 访问密码 (用于 Web 界面登录和通用代理的路径验证)
-    MAX_REDIRECTS: 5,                 // 代理请求时允许的最大重定向次数 (防止死循环)
-    ENABLE_CACHE: true,               // 是否开启 Worker 级缓存 (减少回源请求，重点优化递归模式)
-    CACHE_TTL: 3600,                  // 缓存存活时间 (单位: 秒，默认1小时)
-    
-    // [新增 v5.0] HMAC 签名密钥 (务必修改此值以确保安全)
-    // 用于生成 /s/<exp>/<sig>/<target> 的免密链接
-    SIGN_SECRET: "change-me-to-a-secure-random-string",
+    // --- 基础配置 ---
+    PASSWORD: "123456",               // 访问密码 (用于 Web 界面登录和通用代理的路径验证)
+    MAX_REDIRECTS: 5,                 // 代理请求时允许的最大重定向次数 (防止死循环)
+    ENABLE_CACHE: true,               // 是否开启 Worker 级缓存 (减少回源请求，重点优化递归模式)
+    CACHE_TTL: 3600,                  // 缓存存活时间 (单位: 秒，默认1小时)
+    
+    // [新增 v5.0] HMAC 签名密钥 (务必修改此值以确保安全)
+    // 用于生成 /s/<exp>/<sig>/<target> 的免密链接
+    SIGN_SECRET: "change-me-to-a-secure-random-string",
 
-    // --- 访问控制 (安全设置) ---
-    BLACKLIST: "",                    // 域名黑名单 (逗号分隔，禁止代理这些域名的内容)
-    WHITELIST: "",                    // 域名白名单 (逗号分隔，如果不为空，则只允许代理这些域名)
-    ALLOW_IPS: "",                    // 允许访问本 Worker 的客户端 IP (空则允许所有)
-    ALLOW_COUNTRIES: "",              // 允许访问的国家代码 (如 CN, US)
-    
-    // --- 免密访问增强 ---
-    // [修改] 指定允许免密访问的来源 Referer。支持逗号分隔多个。
-    // 格式支持两种：
-    // 1. 仅域名 (如 "github.com") -> 只要来源是该域名(或子域名)即通过。
-    // 2. 完整 URL 前缀 (如 "https://github.com/Kevin-YST-Du") -> 必须以该路径开头才通过。
-    ALLOW_REFERER: `
-    github.com
-    nodeseek.com
-    `,                              
-    
-    // [新增] 指定允许免密访问的 User-Agent (浏览器/客户端标识)。
-    // 只要请求头中的 User-Agent 包含此字符串，即允许免密下载/访问。
-    // 例如设置为 "MySecretKey"，则 curl -A "MySecretKey" 即可直接访问。
-    ALLOW_USER_AGENT: "", 
+    // --- 访问控制 (安全设置) ---
+    BLACKLIST: "",                    // 域名黑名单 (逗号分隔，禁止代理这些域名的内容)
+    WHITELIST: "",                    // 域名白名单 (逗号分隔，如果不为空，则只允许代理这些域名)
+    ALLOW_IPS: "",                    // 允许访问本 Worker 的客户端 IP (空则允许所有)
+    ALLOW_COUNTRIES: "",              // 允许访问的国家代码 (如 CN, US)
+    
+    // --- 免密访问增强 ---
+    // [修改] 指定允许免密访问的来源 Referer。支持逗号分隔多个。
+    // 格式支持两种：
+    // 1. 仅域名 (如 "github.com") -> 只要来源是该域名(或子域名)即通过。
+    // 2. 完整 URL 前缀 (如 "https://github.com/Kevin-YST-Du") -> 必须以该路径开头才通过。
+    ALLOW_REFERER: `
+    github.com
+    nodeseek.com
+    `,                              
+    
+    // [新增] 指定允许免密访问的 User-Agent (浏览器/客户端标识)。
+    // 只要请求头中的 User-Agent 包含此字符串，即允许免密下载/访问。
+    // 例如设置为 "MySecretKey"，则 curl -A "MySecretKey" 即可直接访问。
+    ALLOW_USER_AGENT: "", 
 
-    // --- 额度限制 (依赖 KV 或 D1 存储) ---
-    DAILY_LIMIT_COUNT: 200,           // 每个 IP 每日最大请求次数 (防滥用)
-    
-    // [新增] 免费路径列表 (不消耗额度的路径前缀)
-    // 访问以下开头的路径将不会计入每日限制，通常用于 Linux 软件源
-    FREE_PATHS: `
-    ubuntu
-    debian
-    centos
-    rockylinux
-    almalinux
-    fedora
-    alpine
-    kali
-    termux
+    // --- 额度限制 (依赖 KV 或 D1 存储) ---
+    DAILY_LIMIT_COUNT: 200,           // 每个 IP 每日最大请求次数 (防滥用)
+    
+    // [新增] 免费路径列表 (不消耗额度的路径前缀)
+    // 访问以下开头的路径将不会计入每日限制，通常用于 Linux 软件源
+    FREE_PATHS: `
+    ubuntu
+    debian
+    centos
+    rockylinux
+    almalinux
+    fedora
+    alpine
+    kali
+    termux
+    `,
+
+    // --- 权限管理 ---
+    // 管理员 IP 列表 (拥有以下权限：
+    // 1. 免密码直接访问 Dashboard 和代理路径
+    // 2. 重置额度、查看统计、清空全站数据
+    // 3. [新增] 查看详细的访问日志)
+    ADMIN_IPS: `
+    127.0.0.1
+    `,                        
+    
+    // 免额度 IP 白名单 (这些 IP 的请求不计入每日限额，且自动免密访问)
+    IP_LIMIT_WHITELIST: `
+    127.0.0.1
+    `, 
+
+    // [新增] 伪装域名
+    // 当访问没有带正确密码，且不是 Admin/白名单 IP 时，跳转到此地址。
+    // 如果留空 ""，则保持原来的 404 Not Found 行为。
+    // [新增] 伪装内容地址 (反向代理)
+    // 1. 完整 URL: "https://www.baidu.com"
+    // 2. 纯域名: "www.baidu.com" (自动使用 https)
+    // 3. 带路径: "example.com/about"
+    CAMOUFLAGE_URL: "blog.spacenb.com,blog.2055555.xyz,www.baidu.com,www.bing.com",
+    // [新增] 伪装模式: random (每次随机洗牌) 或 failover (按顺序尝试)
+    CAMOUFLAGE_MODE: "random",
+
+    // --- [新增] 自定义扩展源 (可通过 Cloudflare Worker 环境变量覆盖) ---
+    // 格式支持: "别名:完整URL"，多个源可用逗号或直接换行分隔
+    /**
+    * 开发者上游源配置清单 - 2026 整理版
+    */
+
+    // 1. 云原生与容器镜像源 (Container Registries)
+    // 包含主流公有云、K8s 组件及特定厂商镜像库
+    CUSTOM_REGISTRY_MAP: `
+    docker.io:https://registry-1.docker.io,
+    ghcr.io:https://ghcr.io,
+    quay.io:https://quay.io,
+    gcr.io:https://gcr.io,
+    k8s.gcr.io:https://k8s.gcr.io,
+    registry.k8s.io:https://registry.k8s.io,
+    nvcr.io:https://nvcr.io,
+    mcr.microsoft.com:https://mcr.microsoft.com,
+    public.ecr.aws:https://public.ecr.aws,
+    registry.access.redhat.com:https://registry.access.redhat.com,
+    registry.gitlab.com:https://registry.gitlab.com,
+    docker.elastic.co:https://docker.elastic.co,
+    rocks.canonical.com:https://rocks.canonical.com,
+    docker.cloudsmith.io:https://docker.cloudsmith.io,
+    registry.jujucharms.com:https://registry.jujucharms.com,
+    icr.io:https://icr.io
     `,
 
-    // --- 权限管理 ---
-    // 管理员 IP 列表 (拥有以下权限：
-    // 1. 免密码直接访问 Dashboard 和代理路径
-    // 2. 重置额度、查看统计、清空全站数据
-    // 3. [新增] 查看详细的访问日志)
-    ADMIN_IPS: `
-    127.0.0.1
-    `,                        
-    
-    // 免额度 IP 白名单 (这些 IP 的请求不计入每日限额，且自动免密访问)
-    IP_LIMIT_WHITELIST: `
-    127.0.0.1
-    `, 
+    // 2. 操作系统发行版源 (Linux Distributions)
+    // 涵盖服务器端主流 OS 及安全/移动端特殊发行版
+    CUSTOM_LINUX_MIRRORS: `
+    ubuntu:http://archive.ubuntu.com/ubuntu,
+    debian:http://deb.debian.org/debian,
+    centos:http://mirror.stream.centos.org,
+    rocky:https://dl.rockylinux.org/pub/rocky,
+    alma:https://repo.almalinux.org/almalinux,
+    fedora:https://dl.fedoraproject.org/pub/fedora/linux,
+    alpine:https://dl-cdn.alpinelinux.org/alpine,
+    kali:http://http.kali.org/kali,
+    arch:https://mirrors.kernel.org/archlinux,
+    termux:https://packages-cf.termux.dev/apt/termux-main
+    `,
 
-    // [新增] 伪装域名
-    // 当访问没有带正确密码，且不是 Admin/白名单 IP 时，跳转到此地址。
-    // 如果留空 ""，则保持原来的 404 Not Found 行为。
-    // [新增] 伪装内容地址 (反向代理)
-    // 1. 完整 URL: "https://www.baidu.com"
-    // 2. 纯域名: "www.baidu.com" (自动使用 https)
-    // 3. 带路径: "example.com/about"
-    CAMOUFLAGE_URL: "blog.spacenb.com,blog.2055555.xyz,www.baidu.com,www.bing.com",
-    // [新增] 伪装模式: random (每次随机洗牌) 或 failover (按顺序尝试)
-    CAMOUFLAGE_MODE: "random",
-
-    // --- [新增] 自定义扩展源 (可通过 Cloudflare Worker 环境变量覆盖) ---
-    // 格式支持: "别名:完整URL"，多个源可用逗号或直接换行分隔
-    CUSTOM_REGISTRY_MAP: ``,
-    CUSTOM_LINUX_MIRRORS: ``,
+    // 3. 编程语言包管理器源 (Language Package Managers)
+    // 包含前端、后端、移动端及跨平台开发的官方上游
+    CUSTOM_PKG_MIRRORS: `
+    npm:https://registry.npmjs.org,
+    pnpm:https://registry.npmjs.org,
+    bun:https://registry.npmjs.org,
+    pip:https://pypi.org/simple,
+    conda:https://repo.anaconda.com/pkgs/main,
+    go:https://proxy.golang.org,
+    cargo:https://static.rust-lang.org,
+    crates:https://index.crates.io,
+    maven:https://repo1.maven.org/maven2,
+    google_maven:https://maven.google.com,
+    composer:https://packagist.org,
+    rubygems:https://rubygems.org,
+    deno:https://deno.land/x,
+    pub:https://pub.dev,
+    cocoapods:https://github.com/CocoaPods/Specs.git,
+    swift:https://swiftpackageindex.com,
+    conan:https://center.conan.io,
+    hackage:https://hackage.haskell.org
+    `,
 };
 
 // 支持的 Docker Registry 上游列表 (用于判断请求是否指向已知的 Registry)
 const DOCKER_REGISTRIES = [
-    'docker.io', 'registry-1.docker.io', 'quay.io', 'gcr.io', 
-    'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io'
+    'docker.io', 'registry-1.docker.io', 'quay.io', 'gcr.io', 
+    'k8s.gcr.io', 'registry.k8s.io', 'ghcr.io', 'docker.cloudsmith.io'
 ];
 
 // Docker 简写映射：将用户输入的 registry 别名映射到完整的 HTTPS URL
 const REGISTRY_MAP = {
-    'ghcr.io': 'https://ghcr.io',
-    'quay.io': 'https://quay.io',
-    'gcr.io': 'https://gcr.io',
-    'k8s.gcr.io': 'https://k8s.gcr.io',
-    'registry.k8s.io': 'https://registry.k8s.io',
-    'docker.cloudsmith.io': 'https://docker.cloudsmith.io',
-    'nvcr.io': 'https://nvcr.io',
-    
-    // [新增] 常用扩充源
-    'mcr.microsoft.com': 'https://mcr.microsoft.com',        // Microsoft
-    'public.ecr.aws': 'https://public.ecr.aws',              // Amazon ECR Public
-    'registry.access.redhat.com': 'https://registry.access.redhat.com', // RedHat
-    'registry.gitlab.com': 'https://registry.gitlab.com',    // GitLab
-    'ccr.ccs.tencentyun.com': 'https://ccr.ccs.tencentyun.com', // 腾讯云个人/公共
-    'registry.cn-hangzhou.aliyuncs.com': 'https://registry.cn-hangzhou.aliyuncs.com', // 阿里云(示例)
-    'docker.elastic.co': 'https://docker.elastic.co'         // Elastic
+    'ghcr.io': 'https://ghcr.io',
+    'quay.io': 'https://quay.io',
+    'gcr.io': 'https://gcr.io',
+    'k8s.gcr.io': 'https://k8s.gcr.io',
+    'registry.k8s.io': 'https://registry.k8s.io',
+    'docker.cloudsmith.io': 'https://docker.cloudsmith.io',
+    'nvcr.io': 'https://nvcr.io',
+    
+    // [新增] 常用扩充源
+    'mcr.microsoft.com': 'https://mcr.microsoft.com',        // Microsoft
+    'public.ecr.aws': 'https://public.ecr.aws',              // Amazon ECR Public
+    'registry.access.redhat.com': 'https://registry.access.redhat.com', // RedHat
+    'registry.gitlab.com': 'https://registry.gitlab.com',    // GitLab
+    'ccr.ccs.tencentyun.com': 'https://ccr.ccs.tencentyun.com', // 腾讯云个人/公共
+    'registry.cn-hangzhou.aliyuncs.com': 'https://registry.cn-hangzhou.aliyuncs.com', // 阿里云(示例)
+    'docker.elastic.co': 'https://docker.elastic.co'         // Elastic
 };
 
 // Linux 软件源镜像映射 (Key: URL路径前缀, Value: 上游官方源地址)
 const LINUX_MIRRORS = {
-    'ubuntu': 'http://archive.ubuntu.com/ubuntu',
-    'ubuntu-security': 'http://security.ubuntu.com/ubuntu', // Ubuntu 安全源单独处理
-    'debian': 'http://deb.debian.org/debian',
-    'debian-security': 'http://security.debian.org/debian-security', // Debian 安全源单独处理
-    'centos': 'https://vault.centos.org',
-    'centos-stream': 'http://mirror.stream.centos.org',
-    'rockylinux': 'https://download.rockylinux.org/pub/rocky', // Rocky Linux (CentOS 替代品)
-    'almalinux': 'https://repo.almalinux.org/almalinux', // AlmaLinux (CentOS 替代品)
-    'fedora': 'https://download.fedoraproject.org/pub/fedora/linux', 
-    'alpine': 'http://dl-cdn.alpinelinux.org/alpine',
-    'kali': 'http://http.kali.org/kali',
-    'archlinux': 'https://geo.mirror.pkgbuild.com',
-    'termux': 'https://packages.termux.org/apt/termux-main'      
+    'ubuntu': 'http://archive.ubuntu.com/ubuntu',
+    'ubuntu-security': 'http://security.ubuntu.com/ubuntu', // Ubuntu 安全源单独处理
+    'debian': 'http://deb.debian.org/debian',
+    'debian-security': 'http://security.debian.org/debian-security', // Debian 安全源单独处理
+    'centos': 'https://vault.centos.org',
+    'centos-stream': 'http://mirror.stream.centos.org',
+    'rockylinux': 'https://download.rockylinux.org/pub/rocky', // Rocky Linux (CentOS 替代品)
+    'almalinux': 'https://repo.almalinux.org/almalinux', // AlmaLinux (CentOS 替代品)
+    'fedora': 'https://download.fedoraproject.org/pub/fedora/linux', 
+    'alpine': 'http://dl-cdn.alpinelinux.org/alpine',
+    'kali': 'http://http.kali.org/kali',
+    'archlinux': 'https://geo.mirror.pkgbuild.com',
+    'termux': 'https://packages.termux.org/apt/termux-main'      
+};
+
+// [新增] 开发者工具/包管理器镜像映射 (Key: URL路径前缀, Value: 上游官方源地址)
+const PKG_MIRRORS = {
+    'npm': 'https://registry.npmjs.org',
+    'pypi': 'https://pypi.org',
+    'pypi-files': 'https://files.pythonhosted.org', // PyPI 实际包下载地址
+    'rust': 'https://static.crates.io', // Rust / Cargo
+    'rubygems': 'https://rubygems.org', // Ruby
+    'goproxy': 'https://proxy.golang.org', // Go
+    'maven': 'https://repo1.maven.org/maven2', // Java / Maven
+    'composer': 'https://repo.packagist.org', // PHP / Composer
+    'nuget': 'https://api.nuget.org/v3-flatcontainer', // .NET
+    'docker-ce': 'https://download.docker.com', // Docker 软件源
+    'brew': 'https://ghcr.io/v2/homebrew/core' // Homebrew
 };
 
 // 网站图标 (一个简单的闪电 SVG)
@@ -157,60 +232,66 @@ const LIGHTNING_SVG = `<svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3
 // ==============================================================================
 
 export default {
-    async fetch(request, env, ctx) {
-        const startTime = Date.now();
+    async fetch(request, env, ctx) {
+        const startTime = Date.now();
 
-        const parseList = (v, d) => (v || d).split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
-        
-        // [新增] 解析键值对映射 (支持 别名:URL 格式)
-        const parseMap = (v, d) => {
-            const map = {};
-            parseList(v, d).forEach(item => {
-                const index = item.indexOf(':');
-                if (index > 0) {
-                    const key = item.substring(0, index).trim();
-                    // 截取冒号后面的所有内容(避免破坏 https:// 中的冒号)
-                    const value = item.substring(index + 1).trim(); 
-                    if (key && value && !key.startsWith('#')) map[key] = value;
-                }
-            });
-            return map;
-        };
+        const parseList = (v, d) => (v || d).split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
+        
+        // [新增] 解析键值对映射 (支持 别名:URL 格式)
+        const parseMap = (v, d) => {
+            const map = {};
+            parseList(v, d).forEach(item => {
+                const index = item.indexOf(':');
+                if (index > 0) {
+                    const key = item.substring(0, index).trim();
+                    // 截取冒号后面的所有内容(避免破坏 https:// 中的冒号)
+                    const value = item.substring(index + 1).trim(); 
+                    if (key && value && !key.startsWith('#')) map[key] = value;
+                }
+            });
+            return map;
+        };
 
-        const CONFIG = {
-            PASSWORD: env.PASSWORD || DEFAULT_CONFIG.PASSWORD,
-            ADMIN_IPS: parseList(env.ADMIN_IPS, DEFAULT_CONFIG.ADMIN_IPS),
-            ALLOW_REFERER: env.ALLOW_REFERER || DEFAULT_CONFIG.ALLOW_REFERER,
-            ALLOW_USER_AGENT: env.ALLOW_USER_AGENT || DEFAULT_CONFIG.ALLOW_USER_AGENT,
-            MAX_REDIRECTS: parseInt(env.MAX_REDIRECTS || DEFAULT_CONFIG.MAX_REDIRECTS),
-            ENABLE_CACHE: (env.ENABLE_CACHE || "true") === "true",
-            CACHE_TTL: parseInt(env.CACHE_TTL || DEFAULT_CONFIG.CACHE_TTL),
-            BLACKLIST: parseList(env.BLACKLIST, DEFAULT_CONFIG.BLACKLIST),
-            WHITELIST: parseList(env.WHITELIST, DEFAULT_CONFIG.WHITELIST),
-            ALLOW_IPS: parseList(env.ALLOW_IPS, DEFAULT_CONFIG.ALLOW_IPS),
-            ALLOW_COUNTRIES: parseList(env.ALLOW_COUNTRIES, DEFAULT_CONFIG.ALLOW_COUNTRIES),
-            DAILY_LIMIT_COUNT: parseInt(env.DAILY_LIMIT_COUNT || DEFAULT_CONFIG.DAILY_LIMIT_COUNT),
-            IP_LIMIT_WHITELIST: parseList(env.IP_LIMIT_WHITELIST, DEFAULT_CONFIG.IP_LIMIT_WHITELIST),
-            FREE_PATHS: parseList(env.FREE_PATHS, DEFAULT_CONFIG.FREE_PATHS),
-            CAMOUFLAGE_URLS: parseList(env.CAMOUFLAGE_URL, DEFAULT_CONFIG.CAMOUFLAGE_URL),
-            CAMOUFLAGE_MODE: (env.CAMOUFLAGE_MODE || DEFAULT_CONFIG.CAMOUFLAGE_MODE).toLowerCase(),
-            SIGN_SECRET: env.SIGN_SECRET || DEFAULT_CONFIG.SIGN_SECRET,
-            
-            // [新增] 解析环境变量中的自定义源
-            CUSTOM_REGISTRY_MAP: parseMap(env.CUSTOM_REGISTRY_MAP, DEFAULT_CONFIG.CUSTOM_REGISTRY_MAP),
-            CUSTOM_LINUX_MIRRORS: parseMap(env.CUSTOM_LINUX_MIRRORS, DEFAULT_CONFIG.CUSTOM_LINUX_MIRRORS),
-        };
+        const CONFIG = {
+            PASSWORD: env.PASSWORD || DEFAULT_CONFIG.PASSWORD,
+            ADMIN_IPS: parseList(env.ADMIN_IPS, DEFAULT_CONFIG.ADMIN_IPS),
+            ALLOW_REFERER: env.ALLOW_REFERER || DEFAULT_CONFIG.ALLOW_REFERER,
+            ALLOW_USER_AGENT: env.ALLOW_USER_AGENT || DEFAULT_CONFIG.ALLOW_USER_AGENT,
+            MAX_REDIRECTS: parseInt(env.MAX_REDIRECTS || DEFAULT_CONFIG.MAX_REDIRECTS),
+            ENABLE_CACHE: (env.ENABLE_CACHE || "true") === "true",
+            CACHE_TTL: parseInt(env.CACHE_TTL || DEFAULT_CONFIG.CACHE_TTL),
+            BLACKLIST: parseList(env.BLACKLIST, DEFAULT_CONFIG.BLACKLIST),
+            WHITELIST: parseList(env.WHITELIST, DEFAULT_CONFIG.WHITELIST),
+            ALLOW_IPS: parseList(env.ALLOW_IPS, DEFAULT_CONFIG.ALLOW_IPS),
+            ALLOW_COUNTRIES: parseList(env.ALLOW_COUNTRIES, DEFAULT_CONFIG.ALLOW_COUNTRIES),
+            DAILY_LIMIT_COUNT: parseInt(env.DAILY_LIMIT_COUNT || DEFAULT_CONFIG.DAILY_LIMIT_COUNT),
+            IP_LIMIT_WHITELIST: parseList(env.IP_LIMIT_WHITELIST, DEFAULT_CONFIG.IP_LIMIT_WHITELIST),
+            FREE_PATHS: parseList(env.FREE_PATHS, DEFAULT_CONFIG.FREE_PATHS),
+            CAMOUFLAGE_URLS: parseList(env.CAMOUFLAGE_URL, DEFAULT_CONFIG.CAMOUFLAGE_URL),
+            CAMOUFLAGE_MODE: (env.CAMOUFLAGE_MODE || DEFAULT_CONFIG.CAMOUFLAGE_MODE).toLowerCase(),
+            SIGN_SECRET: env.SIGN_SECRET || DEFAULT_CONFIG.SIGN_SECRET,
+            
+            // [新增] 解析环境变量中的自定义源
+            CUSTOM_REGISTRY_MAP: parseMap(env.CUSTOM_REGISTRY_MAP, DEFAULT_CONFIG.CUSTOM_REGISTRY_MAP),
+            CUSTOM_LINUX_MIRRORS: parseMap(env.CUSTOM_LINUX_MIRRORS, DEFAULT_CONFIG.CUSTOM_LINUX_MIRRORS),
+            CUSTOM_PKG_MIRRORS: parseMap(env.CUSTOM_PKG_MIRRORS, DEFAULT_CONFIG.CUSTOM_PKG_MIRRORS), // [新增]
+        };
 
-        // [新增] 动态将环境变量注入到全局常量中 (Worker 实例运行期间生效)
-        Object.assign(REGISTRY_MAP, CONFIG.CUSTOM_REGISTRY_MAP);
-        Object.assign(LINUX_MIRRORS, CONFIG.CUSTOM_LINUX_MIRRORS);
-        
-        // 自动将新加的 Docker 仓库别名推入验证列表
-        Object.keys(CONFIG.CUSTOM_REGISTRY_MAP).forEach(key => {
-            if (!DOCKER_REGISTRIES.includes(key)) DOCKER_REGISTRIES.push(key);
-        });
+        // [新增] 动态将环境变量注入到全局常量中 (Worker 实例运行期间生效)
+        Object.assign(REGISTRY_MAP, CONFIG.CUSTOM_REGISTRY_MAP);
+        Object.assign(LINUX_MIRRORS, CONFIG.CUSTOM_LINUX_MIRRORS);
+        Object.assign(PKG_MIRRORS, CONFIG.CUSTOM_PKG_MIRRORS); // [新增]
+        
+        // 自动将新加的 Docker 仓库别名推入验证列表
+        Object.keys(CONFIG.CUSTOM_REGISTRY_MAP).forEach(key => {
+            if (!DOCKER_REGISTRIES.includes(key)) DOCKER_REGISTRIES.push(key);
+        });
 
-        const url = new URL(request.url);
+        // [重要新增] 自动将所有 Linux 和 包管理器 路径加入免额度白名单 (防止大批量下载触发封禁)
+        Object.keys(LINUX_MIRRORS).forEach(k => { if (!CONFIG.FREE_PATHS.includes(k)) CONFIG.FREE_PATHS.push(k); });
+        Object.keys(PKG_MIRRORS).forEach(k => { if (!CONFIG.FREE_PATHS.includes(k)) CONFIG.FREE_PATHS.push(k); });
+
+        const url = new URL(request.url);
         const clientIP = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
         const userAgent = (request.headers.get("User-Agent") || "").toLowerCase();
         const referer = request.headers.get("Referer") || "";
@@ -548,47 +629,58 @@ export default {
                     }
 
                     // --- Linux / Proxy ---
-                    if (!response && subPath) {
-                        const sortedMirrors = Object.keys(LINUX_MIRRORS).sort((a, b) => b.length - a.length);
-                        const linuxDistro = sortedMirrors.find(k => subPath.startsWith(k + '/') || subPath === k);
+                    if (!response && subPath) {
+                        const sortedMirrors = Object.keys(LINUX_MIRRORS).sort((a, b) => b.length - a.length);
+                        const linuxDistro = sortedMirrors.find(k => subPath.startsWith(k + '/') || subPath === k);
 
-                        let proxyMode = 'raw';
-                        let targetUrlPart = subPath;
+                        // [新增] 包管理器匹配
+                        const sortedPkgMirrors = Object.keys(PKG_MIRRORS).sort((a, b) => b.length - a.length);
+                        const pkgDistro = sortedPkgMirrors.find(k => subPath.startsWith(k + '/') || subPath === k);
 
-                        if (subPath.startsWith('rt/') || subPath === 'rt') {
-                            proxyMode = 'recursive_text';
-                            targetUrlPart = subPath.replace(/^rt\/?/, "");
-                        } else if (subPath.startsWith('r/') || subPath === 'r') {
-                            proxyMode = 'recursive_all';
-                            targetUrlPart = subPath.replace(/^r\/?/, "");
-                        }
+                        let proxyMode = 'raw';
+                        let targetUrlPart = subPath;
 
-                        if (linuxDistro) {
-                            const realPath = subPath.replace(linuxDistro, '').replace(/^\//, '');
-                            const upstreamBase = LINUX_MIRRORS[linuxDistro];
-                            finalUpstream = upstreamBase;
-                            response = await handleLinuxMirrorRequest(request, upstreamBase, realPath);
-                        } else {
-                            finalUpstream = targetUrlPart;
-                            const proxyResult = await handleGeneralProxy(
-                                request,
-                                targetUrlPart + (url.search || ""),
-                                CONFIG,
-                                proxyMode,
-                                ctx
-                            );
-                            response = proxyResult.response;
-                            isCacheHit = proxyResult.cacheHit;
+                        if (subPath.startsWith('rt/') || subPath === 'rt') {
+                            proxyMode = 'recursive_text';
+                            targetUrlPart = subPath.replace(/^rt\/?/, "");
+                        } else if (subPath.startsWith('r/') || subPath === 'r') {
+                            proxyMode = 'recursive_all';
+                            targetUrlPart = subPath.replace(/^r\/?/, "");
+                        }
 
-                            if (response && response.status === 200 && !isWhitelisted && !isFreePath) {
-                                const isDuplicate = await checkIsDuplicate(clientIP, subPath);
-                                if (!isDuplicate) {
-                                    shouldCharge = true;
-                                    ctx.waitUntil(setDuplicateFlag(clientIP, subPath));
-                                }
-                            }
-                        }
-                    }
+                        if (linuxDistro) {
+                            const realPath = subPath.replace(linuxDistro, '').replace(/^\//, '');
+                            const upstreamBase = LINUX_MIRRORS[linuxDistro];
+                            finalUpstream = upstreamBase;
+                            response = await handleLinuxMirrorRequest(request, upstreamBase, realPath);
+                        } else if (pkgDistro) {
+                            // [新增] 开发者包管理器分支
+                            const realPath = subPath.replace(pkgDistro, '').replace(/^\//, '');
+                            const upstreamBase = PKG_MIRRORS[pkgDistro];
+                            finalUpstream = upstreamBase;
+                            // 包管理器逻辑与Linux源类似，需要支持 Range 且抹除 CF 节点追踪，因此完美复用 handleLinuxMirrorRequest 
+                            response = await handleLinuxMirrorRequest(request, upstreamBase, realPath);
+                        } else {
+                            finalUpstream = targetUrlPart;
+                            const proxyResult = await handleGeneralProxy(
+                                request,
+                                targetUrlPart + (url.search || ""),
+                                CONFIG,
+                                proxyMode,
+                                ctx
+                            );
+                            response = proxyResult.response;
+                            isCacheHit = proxyResult.cacheHit;
+
+                            if (response && response.status === 200 && !isWhitelisted && !isFreePath) {
+                                const isDuplicate = await checkIsDuplicate(clientIP, subPath);
+                                if (!isDuplicate) {
+                                    shouldCharge = true;
+                                    ctx.waitUntil(setDuplicateFlag(clientIP, subPath));
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
@@ -1464,6 +1556,14 @@ function renderDashboard(hostname, password, ip, count, limit, adminIps) {
     }
     const linuxMirrorsJson = (typeof LINUX_MIRRORS !== 'undefined') ? JSON.stringify(Object.keys(LINUX_MIRRORS)) : '[]';
 
+    // [新增] 生成包管理器选项
+    let pkgOptionsHtml = '<option value="" disabled selected data-i18n="pkg_select">请选择包管理器 (Select Package)...</option>';
+    if (typeof PKG_MIRRORS !== 'undefined') {
+        Object.keys(PKG_MIRRORS).forEach(pkg => {
+            pkgOptionsHtml += `<option value="${pkg}">${pkg}</option>`;
+        });
+    }
+
     return `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -2139,7 +2239,7 @@ pre,
         <div class="w-full bg-gray-200 dark:bg-slate-700 rounded-full h-2.5 overflow-hidden mb-3">
           <div class="bg-blue-600 dark:bg-blue-500 h-full transition-all duration-1000 ease-out" style="width: ${percent}%"></div>
         </div>
-        <p class="text-[11px] opacity-60 flex items-center gap-1"><svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg><span data-i18n="limit_desc">失败自动退还额度 · 短时重复请求不扣费 · <span class="text-green-600 dark:text-green-400 font-bold">软件源镜像 (Ubuntu 等) 免费不限量</span></span></p>
+        <p class="text-[11px] opacity-60 flex items-center gap-1"><svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg><span data-i18n="limit_desc">失败自动退还额度 · 短时重复请求不扣费 · <span class="text-green-600 dark:text-green-400 font-bold">软件源/开发源免费不限量</span></span></p>
         <div id="stats-panel" class="hidden mt-4 p-4 rounded-xl bg-gray-50 dark:bg-slate-800/50 border border-gray-200 dark:border-slate-700">
             <div class="flex justify-between items-center mb-2"><h4 class="text-xs font-bold opacity-70 uppercase tracking-wider" data-i18n="stats_overview">今日全站概况</h4>${isAdmin ? `<button onclick="openModal('confirmResetAllModal')" class="text-[10px] text-red-500 hover:text-red-700 font-bold border border-red-200 hover:border-red-400 bg-red-50 hover:bg-red-100 px-2 py-0.5 rounded transition" data-i18n="reset_all_data">清空全站数据</button>` : ''}</div>
             <div class="mb-2 text-xs font-mono text-blue-600 dark:text-blue-400 border-b border-gray-200 dark:border-slate-700 pb-2"><span id="stats-summary" data-i18n="loading">正在加载...</span></div>
@@ -2344,7 +2444,34 @@ pre,
             <button onclick="copyLinuxCommand()" class="w-full bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition" data-i18n="copy_cmd">复制命令</button>
         </div>
       </div>
- 
+
+      <div class="section-box">
+        <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
+          <span class="text-xl">📦</span> <span data-i18n="pkg_title">开发者工具 / 包管理器加速</span>
+        </h2>
+        <div class="flex flex-responsive gap-3">
+          <div class="relative flex-none">
+              <select id="pkg-distro" class="w-full md:w-48 p-3.5 rounded-lg text-sm bg-gray-50 dark:bg-slate-800 border border-gray-200 dark:border-slate-700 outline-none cursor-pointer appearance-none">
+                  ${pkgOptionsHtml}
+              </select>
+              <div class="absolute inset-y-0 right-0 flex items-center px-2 pointer-events-none text-gray-500">
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"></path></svg>
+              </div>
+          </div>
+          <button onclick="generatePkgCommand()" class="bg-teal-600 hover:bg-teal-700 text-white px-6 py-3.5 rounded-lg transition font-bold text-sm shadow-md whitespace-nowrap flex items-center justify-center gap-1 w-full md:w-auto">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l3 3-3 3m5 0h3M4 17h16a2 2 0 002-2V9a2 2 0 00-2-2H4a2 2 0 00-2 2v6a2 2 0 002 2z"></path></svg>
+              <span data-i18n="gen_pkg_cmd">生成配置命令</span>
+          </button>
+        </div>
+        <div id="pkg-result-box" class="hidden mt-5">
+            <p class="text-xs opacity-70 mb-2" data-i18n="use_pkg_cmd_replace">使用以下命令配置镜像源：</p>
+            <div class="p-4 bg-teal-50 dark:bg-teal-900/20 border border-teal-100 dark:border-teal-800 rounded-lg mb-3">
+                <p id="pkg-result" class="text-teal-700 dark:text-teal-400 font-mono text-xs break-all select-all whitespace-pre-wrap"></p>
+            </div>
+            <button onclick="copyPkgCommand()" class="w-full bg-gray-100 dark:bg-slate-700 hover:bg-gray-200 dark:hover:bg-slate-600 text-gray-700 dark:text-gray-200 py-2.5 rounded-lg text-xs font-bold transition" data-i18n="copy_cmd">复制命令</button>
+        </div>
+      </div>
+
       <div class="section-box">
           <h2 class="text-lg font-bold mb-4 flex items-center gap-2 opacity-90">
               <svg class="w-5 h-5 text-purple-600 dark:text-purple-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"/><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/></svg>
@@ -2561,7 +2688,7 @@ pre,
             "reset_limit": "Reset",
             "admin_stats": "Stats",
             "access_logs": "Logs",
-            "limit_desc": "Quota refunds on failure · Short-term dupes ignored · <span class='text-green-600 dark:text-green-400 font-bold'>Linux Mirrors (Ubuntu, etc) are Free</span>",
+            "limit_desc": "Quota refunds on failure · Short-term dupes ignored · <span class='text-green-600 dark:text-green-400 font-bold'>Dev/Linux Mirrors are Free</span>",
             "stats_overview": "Global Overview Today",
             "reset_all_data": "Clear All Data",
             "loading": "Loading...",
@@ -2591,6 +2718,10 @@ pre,
             "gen_mirror_cmd": "Generate Cmd",
             "use_cmd_replace": "Run this to replace sources:",
             "linux_note": "* Note: Replaces official sources only. Manual edit needed for custom sources.",
+            "pkg_title": "Package Manager / Dev Tools",
+            "pkg_select": "Select Package...",
+            "gen_pkg_cmd": "Gen Config",
+            "use_pkg_cmd_replace": "Run this to configure mirror:",
             "daemon_title": "Registry Config (Daemon.json)",
             "daemon_step1": "# 1. Edit Config",
             "daemon_step2": "# 2. Paste Content",
@@ -2624,7 +2755,7 @@ pre,
             "reset_limit": "重置额度",
             "admin_stats": "全站统计",
             "access_logs": "访问日志",
-            "limit_desc": "失败自动退还额度 · 短时重复请求不扣费 · <span class='text-green-600 dark:text-green-400 font-bold'>软件源镜像 (Ubuntu 等) 免费不限量</span>",
+            "limit_desc": "失败自动退还额度 · 短时重复请求不扣费 · <span class='text-green-600 dark:text-green-400 font-bold'>软件源/开发源免费不限量</span>",
             "stats_overview": "今日全站概况",
             "reset_all_data": "清空全站数据",
             "loading": "正在加载...",
@@ -2640,7 +2771,7 @@ pre,
             "terminal_cmd_label": "2. 终端命令:",
             "copy_cmd": "复制命令",
             "recursive_title": "递归脚本加速 (Shell / Curl)",
-            "recursive_desc": "适用于 curl | bash 脚本。可选择强制重写所有 (/r/) 或仅文本递归 (/rt/)。",
+            "recursive_desc": "适用于 curl | bash 脚本。可选择强制重写所有 (/r/) 或仅文本递归 (/rt)。",
             "mode_r": "/r/ 强制重写所有",
             "mode_rt": "/rt/ 仅文本递归",
             "recursive_placeholder": "如: https://get.docker.com",
@@ -2654,6 +2785,10 @@ pre,
             "gen_mirror_cmd": "生成换源命令",
             "use_cmd_replace": "使用以下命令一键替换：",
             "linux_note": "* 注意：脚本仅替换官方默认源。若您已使用其他镜像源（如阿里云），请手动编辑文件。",
+            "pkg_title": "开发者工具 / 包管理器加速",
+            "pkg_select": "请选择包管理器 (Select Package)...",
+            "gen_pkg_cmd": "生成配置命令",
+            "use_pkg_cmd_replace": "使用以下命令配置镜像源：",
             "daemon_title": "镜像源配置 (Daemon.json)",
             "daemon_step1": "# 1. 编辑配置文件",
             "daemon_step2": "# 2. 填入以下内容",
@@ -2707,6 +2842,7 @@ pre,
       let recursiveUrlOnly = '';
       let dockerCommand = '';
       let linuxCommand = '';
+      let pkgCommand = '';
       let daemonJsonStr = '';
 
       // --- I18N Logic ---
@@ -2953,6 +3089,47 @@ pre,
           window.copyToClipboard(linuxCommand).then(() => window.showToast('✅ 已复制换源命令'));
       }
       window.copyLinuxCommand = function() { window.copyToClipboard(linuxCommand).then(() => window.showToast('✅ 已复制')); }
+      
+      // --- [新增] Package Manager Logic ---
+      window.generatePkgCommand = function() {
+          const distro = document.getElementById('pkg-distro').value;
+          if (!distro || distro === "") { return window.showToast('❌ 请先选择一个包管理器', true); }
+
+          const baseUrl = window.location.origin + window.API_PREFIX + '/' + distro + '/';
+          const cleanBaseUrl = baseUrl.replace(/\\/$/, ''); // 去除结尾斜杠
+
+          if (distro === 'npm') {
+              pkgCommand = 'npm config set registry ' + cleanBaseUrl;
+          } else if (distro === 'pypi') {
+              pkgCommand = 'pip config set global.index-url ' + baseUrl + 'simple';
+          } else if (distro === 'pypi-files') {
+              pkgCommand = '# PyPI Files 仅供内部重定向使用，请配置 pypi 即可';
+          } else if (distro === 'rust') {
+              pkgCommand = '[source.crates-io]\\nreplace-with = "my-mirror"\\n[source.my-mirror]\\nregistry = "' + cleanBaseUrl + '"';
+          } else if (distro === 'rubygems') {
+              pkgCommand = 'gem sources --add ' + cleanBaseUrl + ' --remove https://rubygems.org/';
+          } else if (distro === 'goproxy') {
+              pkgCommand = 'go env -w GOPROXY=' + cleanBaseUrl + ',direct';
+          } else if (distro === 'maven') {
+              pkgCommand = '<mirror>\\n  <id>cf-proxy</id>\\n  <mirrorOf>central</mirrorOf>\\n  <name>Cloudflare Proxy</name>\\n  <url>' + cleanBaseUrl + '</url>\\n</mirror>';
+          } else if (distro === 'composer') {
+              pkgCommand = 'composer config -g repo.packagist composer ' + cleanBaseUrl;
+          } else if (distro === 'nuget') {
+              pkgCommand = 'dotnet nuget add source ' + cleanBaseUrl + '/index.json -n cf-proxy';
+          } else if (distro === 'docker-ce') {
+              pkgCommand = '# 请参考 Linux 软件源替换方式，将 download.docker.com 替换为\\n# ' + cleanBaseUrl;
+          } else if (distro === 'brew') {
+              pkgCommand = 'export HOMEBREW_API_DOMAIN="' + cleanBaseUrl + '"\\nexport HOMEBREW_BOTTLE_DOMAIN="' + cleanBaseUrl + '"';
+          } else {
+              pkgCommand = '# 基础 URL:\\n' + baseUrl;
+          }
+
+          document.getElementById('pkg-result').textContent = pkgCommand;
+          document.getElementById('pkg-result-box').classList.remove('hidden');
+          window.copyToClipboard(pkgCommand).then(() => window.showToast('✅ 已生成配置命令'));
+      }
+      window.copyPkgCommand = function() { window.copyToClipboard(pkgCommand).then(() => window.showToast('✅ 已复制')); }
+
       window.copyDaemonJson = function() { window.copyToClipboard(daemonJsonStr).then(() => window.showToast('✅ JSON 配置已复制')); }
 
       // --- Admin Functions ---
