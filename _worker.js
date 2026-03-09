@@ -99,6 +99,11 @@ const DEFAULT_CONFIG = {
     CAMOUFLAGE_URL: "blog.spacenb.com,blog.2055555.xyz,www.baidu.com,www.bing.com",
     // [新增] 伪装模式: random (每次随机洗牌) 或 failover (按顺序尝试)
     CAMOUFLAGE_MODE: "random",
+
+    // --- [新增] 自定义扩展源 (可通过 Cloudflare Worker 环境变量覆盖) ---
+    // 格式支持: "别名:完整URL"，多个源可用逗号或直接换行分隔
+    CUSTOM_REGISTRY_MAP: ``,
+    CUSTOM_LINUX_MIRRORS: ``,
 };
 
 // 支持的 Docker Registry 上游列表 (用于判断请求是否指向已知的 Registry)
@@ -156,6 +161,21 @@ export default {
         const startTime = Date.now();
 
         const parseList = (v, d) => (v || d).split(/[\n,]/).map(s => s.trim()).filter(s => s.length > 0);
+        
+        // [新增] 解析键值对映射 (支持 别名:URL 格式)
+        const parseMap = (v, d) => {
+            const map = {};
+            parseList(v, d).forEach(item => {
+                const index = item.indexOf(':');
+                if (index > 0) {
+                    const key = item.substring(0, index).trim();
+                    // 截取冒号后面的所有内容(避免破坏 https:// 中的冒号)
+                    const value = item.substring(index + 1).trim(); 
+                    if (key && value && !key.startsWith('#')) map[key] = value;
+                }
+            });
+            return map;
+        };
 
         const CONFIG = {
             PASSWORD: env.PASSWORD || DEFAULT_CONFIG.PASSWORD,
@@ -175,7 +195,20 @@ export default {
             CAMOUFLAGE_URLS: parseList(env.CAMOUFLAGE_URL, DEFAULT_CONFIG.CAMOUFLAGE_URL),
             CAMOUFLAGE_MODE: (env.CAMOUFLAGE_MODE || DEFAULT_CONFIG.CAMOUFLAGE_MODE).toLowerCase(),
             SIGN_SECRET: env.SIGN_SECRET || DEFAULT_CONFIG.SIGN_SECRET,
+            
+            // [新增] 解析环境变量中的自定义源
+            CUSTOM_REGISTRY_MAP: parseMap(env.CUSTOM_REGISTRY_MAP, DEFAULT_CONFIG.CUSTOM_REGISTRY_MAP),
+            CUSTOM_LINUX_MIRRORS: parseMap(env.CUSTOM_LINUX_MIRRORS, DEFAULT_CONFIG.CUSTOM_LINUX_MIRRORS),
         };
+
+        // [新增] 动态将环境变量注入到全局常量中 (Worker 实例运行期间生效)
+        Object.assign(REGISTRY_MAP, CONFIG.CUSTOM_REGISTRY_MAP);
+        Object.assign(LINUX_MIRRORS, CONFIG.CUSTOM_LINUX_MIRRORS);
+        
+        // 自动将新加的 Docker 仓库别名推入验证列表
+        Object.keys(CONFIG.CUSTOM_REGISTRY_MAP).forEach(key => {
+            if (!DOCKER_REGISTRIES.includes(key)) DOCKER_REGISTRIES.push(key);
+        });
 
         const url = new URL(request.url);
         const clientIP = request.headers.get("CF-Connecting-IP") || "0.0.0.0";
